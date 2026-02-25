@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>TBS Live Translator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;600&family=Source+Serif+4:ital,wght@0,300;0,400;0,600;1,300&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --gold: #c9a84c;
+    --gold-light: #e8c97a;
+    --gold-dim: #7a6230;
+    --deep: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2333;
+    --border: rgba(201,168,76,0.2);
+    --live-cn: #60a5fa;
+    --live-en: #fb923c;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --red: #f85149;
+    --green: #3fb950;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--deep);
+    color: var(--text);
+    font-family: 'Source Serif 4', Georgia, serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Subtle lotus pattern background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: radial-gradient(ellipse at 20% 50%, rgba(201,168,76,0.04) 0%, transparent 60%),
+                      radial-gradient(ellipse at 80% 20%, rgba(96,165,250,0.03) 0%, transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 20px 16px 40px;
+    position: relative;
+    z-index: 1;
+  }
+
+  /* HEADER */
+  header {
+    text-align: center;
+    padding: 24px 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+
+  .lotus { font-size: 28px; display: block; margin-bottom: 6px; }
+
+  h1 {
+    font-family: 'Noto Serif TC', serif;
+    font-size: clamp(1.4rem, 4vw, 2rem);
+    font-weight: 600;
+    color: var(--gold);
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+
+  .subtitle {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+
+  /* CONTROLS */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+
+  .btn-start {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 32px;
+    border: none;
+    border-radius: 50px;
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 0.05em;
+  }
+
+  .btn-start.start {
+    background: linear-gradient(135deg, #2d6a4f, #3fb950);
+    color: white;
+    box-shadow: 0 0 20px rgba(63,185,80,0.3);
+  }
+
+  .btn-start.start:hover {
+    box-shadow: 0 0 30px rgba(63,185,80,0.5);
+    transform: translateY(-1px);
+  }
+
+  .btn-start.stop {
+    background: linear-gradient(135deg, #6e2020, #f85149);
+    color: white;
+    box-shadow: 0 0 20px rgba(248,81,73,0.3);
+  }
+
+  .btn-start.stop:hover {
+    box-shadow: 0 0 30px rgba(248,81,73,0.5);
+    transform: translateY(-1px);
+  }
+
+  .btn-start:disabled {
+    background: var(--surface2);
+    color: var(--text-dim);
+    box-shadow: none;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .btn-clear {
+    padding: 10px 20px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 50px;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-clear:hover {
+    border-color: var(--gold-dim);
+    color: var(--gold);
+  }
+
+  /* STATUS */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 50px;
+    font-size: 0.8rem;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    transition: all 0.3s;
+  }
+
+  .status-dot.live {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 1.5s infinite;
+  }
+
+  .status-dot.connecting {
+    background: var(--gold);
+    animation: pulse 0.8s infinite;
+  }
+
+  .status-dot.error { background: var(--red); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* PANELS */
+  .panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  @media (max-width: 640px) {
+    .panels { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--gold-dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .panel-body {
+    flex: 1;
+    height: 400px;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 0;
+    scroll-behavior: smooth;
+  }
+
+  @media (max-width: 640px) {
+    .panel-body { height: 220px; }
+  }
+
+  .panel-body::-webkit-scrollbar { width: 4px; }
+  .panel-body::-webkit-scrollbar-track { background: transparent; }
+  .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ENTRIES */
+  .entry {
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    font-size: clamp(0.95rem, 2.5vw, 1.1rem);
+    line-height: 1.7;
+    color: var(--text);
+    animation: fadeIn 0.3s ease;
+  }
+
+  .entry:last-child { border-bottom: none; }
+
+  .entry.en-entry {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .entry.en-entry .entry-text { flex: 1; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* LIVE TEXT */
+  .live-text {
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: clamp(0.95rem, 2.5vw, 1.1rem);
+    line-height: 1.7;
+    margin-bottom: 8px;
+    border-left: 3px solid;
+    animation: fadeIn 0.2s ease;
+  }
+
+  .live-text.cn {
+    color: var(--live-cn);
+    border-color: var(--live-cn);
+    background: rgba(96,165,250,0.06);
+  }
+
+  .live-text.en {
+    color: var(--live-en);
+    border-color: var(--live-en);
+    background: rgba(251,146,60,0.06);
+    font-style: italic;
+  }
+
+  /* COPY BUTTON */
+  .btn-copy {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    padding: 4px 8px;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .btn-copy:hover { border-color: var(--gold-dim); color: var(--gold); }
+  .btn-copy.copied { border-color: var(--green); color: var(--green); }
+
+  /* EMPTY STATE */
+  .empty-state {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    padding: 40px 20px;
+    font-style: italic;
+  }
+
+  /* MANUAL INPUT */
+  .manual-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+
+  .manual-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--gold-dim);
+    margin-bottom: 12px;
+  }
+
+  .manual-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+
+  @media (max-width: 480px) {
+    .manual-row { flex-direction: column; }
+  }
+
+  textarea {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'Noto Serif TC', serif;
+    font-size: 1rem;
+    padding: 10px 14px;
+    resize: none;
+    outline: none;
+    transition: border-color 0.2s;
+    min-height: 60px;
+  }
+
+  textarea:focus { border-color: var(--gold-dim); }
+  textarea::placeholder { color: var(--text-dim); }
+
+  .btn-translate {
+    padding: 10px 20px;
+    background: linear-gradient(135deg, var(--gold-dim), var(--gold));
+    border: none;
+    border-radius: 8px;
+    color: var(--deep);
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+
+  .btn-translate:hover { opacity: 0.9; transform: translateY(-1px); }
+  .btn-translate:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  /* ERROR TOAST */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #3d1a1a;
+    border: 1px solid var(--red);
+    color: #fca5a5;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    max-width: 90vw;
+    text-align: center;
+    z-index: 100;
+    animation: slideUp 0.3s ease;
+    display: none;
+  }
+
+  .toast.show { display: block; }
+
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+    to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+
+  /* MIC ANIMATION */
+  .mic-icon { font-size: 1.1rem; }
+  .mic-icon.recording { animation: micPulse 1s infinite; }
+  @keyframes micPulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.2); }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <span class="lotus">🪷</span>
+    <h1>TBS Live Translator</h1>
+    <p class="subtitle">True Buddha School · Live Sermon Translation</p>
+  </header>
+
+  <div class="controls">
+    <button id="btnStart" class="btn-start start">
+      <span class="mic-icon" id="micIcon">🎙️</span>
+      <span id="btnText">START</span>
+    </button>
+    <button id="btnClear" class="btn-clear">Clear</button>
+    <div class="status-bar">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Ready</span>
+    </div>
+  </div>
+
+  <div class="panels">
+    <div class="panel">
+      <div class="panel-header">🀄 Chinese · Live</div>
+      <div class="panel-body" id="cnPanel">
+        <div class="empty-state" id="cnEmpty">Waiting for speech...</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">🔤 English · Translation</div>
+      <div class="panel-body" id="enPanel">
+        <div class="empty-state" id="enEmpty">Translation will appear here...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="manual-section">
+    <div class="manual-title">✏️ Manual Input</div>
+    <div class="manual-row">
+      <textarea id="manualInput" placeholder="Paste Chinese text here to translate..." rows="2"></textarea>
+      <button id="btnManual" class="btn-translate">Translate</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let ws = null;
+let audioContext = null;
+let mediaStream = null;
+let scriptProcessor = null;
+let audioSource = null;
+let isRecording = false;
+let liveCnEl = null;
+let liveEnEl = null;
+
+// ─── ELEMENTS ────────────────────────────────────────────────────────────────
+const btnStart   = document.getElementById('btnStart');
+const btnText    = document.getElementById('btnText');
+const micIcon    = document.getElementById('micIcon');
+const btnClear   = document.getElementById('btnClear');
+const btnManual  = document.getElementById('btnManual');
+const statusDot  = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const cnPanel    = document.getElementById('cnPanel');
+const enPanel    = document.getElementById('enPanel');
+const cnEmpty    = document.getElementById('cnEmpty');
+const enEmpty    = document.getElementById('enEmpty');
+const manualInput = document.getElementById('manualInput');
+const toast      = document.getElementById('toast');
+
+// ─── STATUS ──────────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  statusDot.className = 'status-dot ' + state;
+  statusText.textContent = text;
+}
+
+// ─── TOAST ───────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 4000);
+}
+
+// ─── PANEL HELPERS ───────────────────────────────────────────────────────────
+function removeLiveEl(panel, el) {
+  if (el && el.parentNode === panel) {
+    panel.removeChild(el);
+  }
+}
+
+function addEntry(panel, emptyEl, text, isCn) {
+  emptyEl.style.display = 'none';
+
+  if (isCn) {
+    const div = document.createElement('div');
+    div.className = 'entry';
+    div.textContent = text;
+    panel.appendChild(div);
+  } else {
+    const div = document.createElement('div');
+    div.className = 'entry en-entry';
+    const span = document.createElement('span');
+    span.className = 'entry-text';
+    span.textContent = text;
+    const btn = document.createElement('button');
+    btn.className = 'btn-copy';
+    btn.textContent = 'Copy';
+    btn.onclick = () => {
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✓ Copied';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      });
+    };
+    div.appendChild(span);
+    div.appendChild(btn);
+    panel.appendChild(div);
+  }
+}
+
+// ─── AUDIO CAPTURE ───────────────────────────────────────────────────────────
+function convertFloat32ToPCM16(float32Array) {
+  const pcm16 = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return pcm16;
+}
+
+async function startAudio() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+  });
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  audioSource = audioContext.createMediaStreamSource(mediaStream);
+  scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+  scriptProcessor.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const pcm = convertFloat32ToPCM16(e.inputBuffer.getChannelData(0));
+    ws.send(pcm.buffer);
+  };
+
+  audioSource.connect(scriptProcessor);
+  scriptProcessor.connect(audioContext.destination);
+}
+
+function stopAudio() {
+  if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+  if (audioSource) { audioSource.disconnect(); audioSource = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+}
+
+// ─── WEBSOCKET ───────────────────────────────────────────────────────────────
+function connectWebSocket() {
+  return new Promise((resolve, reject) => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${protocol}//${location.host}`;
+    console.log('[WS] Connecting to', url);
+
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      console.log('[WS] Connected');
+      resolve();
+    };
+
+    ws.onerror = (err) => {
+      console.error('[WS] Error', err);
+      reject(new Error('WebSocket connection failed'));
+    };
+
+    ws.onclose = () => {
+      console.log('[WS] Closed');
+      if (isRecording) {
+        setStatus('error', 'Disconnected');
+        stopRecording(false);
+      }
+    };
+
+    ws.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch(e) { return; }
+
+      if (msg.type === 'status' && msg.status === 'live') {
+        setStatus('live', 'Live');
+
+      } else if (msg.type === 'live_cn') {
+        cnEmpty.style.display = 'none';
+        if (!liveCnEl) {
+          liveCnEl = document.createElement('div');
+          liveCnEl.className = 'live-text cn';
+          cnPanel.appendChild(liveCnEl);
+        }
+        liveCnEl.textContent = msg.text;
+
+      } else if (msg.type === 'translating') {
+        // Commit the Chinese, show "translating" in EN panel
+        removeLiveEl(cnPanel, liveCnEl);
+        liveCnEl = null;
+        addEntry(cnPanel, cnEmpty, msg.cn, true);
+
+        enEmpty.style.display = 'none';
+        if (!liveEnEl) {
+          liveEnEl = document.createElement('div');
+          liveEnEl.className = 'live-text en';
+          enPanel.appendChild(liveEnEl);
+        }
+        liveEnEl.textContent = 'Translating...';
+
+      } else if (msg.type === 'final') {
+        // Commit to both panels
+        removeLiveEl(cnPanel, liveCnEl); liveCnEl = null;
+        removeLiveEl(enPanel, liveEnEl); liveEnEl = null;
+
+        // Only add CN entry if not already added via 'translating'
+        if (!document.querySelector('#cnPanel .entry:last-child')?.textContent === msg.cn) {
+          addEntry(cnPanel, cnEmpty, msg.cn, true);
+        }
+        addEntry(enPanel, enEmpty, msg.en, false);
+
+      } else if (msg.type === 'manual_translation') {
+        addEntry(cnPanel, cnEmpty, msg.cn, true);
+        addEntry(enPanel, enEmpty, msg.en, false);
+
+      } else if (msg.type === 'error') {
+        showToast('⚠️ ' + msg.message);
+        setStatus('error', 'Error');
+      }
+    };
+
+    // Timeout if no connection in 10s
+    setTimeout(() => reject(new Error('Connection timeout')), 10000);
+  });
+}
+
+// ─── RECORDING CONTROL ───────────────────────────────────────────────────────
+async function startRecording() {
+  btnStart.disabled = true;
+  setStatus('connecting', 'Connecting...');
+
+  try {
+    await connectWebSocket();
+    await startAudio();
+
+    isRecording = true;
+    btnStart.className = 'btn-start stop';
+    btnText.textContent = 'STOP';
+    micIcon.className = 'mic-icon recording';
+    micIcon.textContent = '🔴';
+    btnStart.disabled = false;
+
+  } catch (err) {
+    console.error('[Start] Error:', err.message);
+    showToast('Could not start: ' + err.message);
+    setStatus('', 'Ready');
+    btnStart.disabled = false;
+    stopAudio();
+    if (ws) { ws.close(); ws = null; }
+  }
+}
+
+function stopRecording(sendStop = true) {
+  isRecording = false;
+
+  if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'stop' }));
+    setTimeout(() => { if (ws) { ws.close(); ws = null; } }, 500);
+  } else {
+    if (ws) { ws.close(); ws = null; }
+  }
+
+  stopAudio();
+
+  // Clean up live elements
+  removeLiveEl(cnPanel, liveCnEl); liveCnEl = null;
+  removeLiveEl(enPanel, liveEnEl); liveEnEl = null;
+
+  btnStart.className = 'btn-start start';
+  btnText.textContent = 'START';
+  micIcon.className = 'mic-icon';
+  micIcon.textContent = '🎙️';
+  btnStart.disabled = false;
+  setStatus('', 'Stopped');
+}
+
+// ─── EVENT LISTENERS ─────────────────────────────────────────────────────────
+btnStart.addEventListener('click', () => {
+  if (isRecording) { stopRecording(true); }
+  else { startRecording(); }
+});
+
+btnClear.addEventListener('click', () => {
+  // Keep live elements, remove committed entries
+  const cnEntries = cnPanel.querySelectorAll('.entry');
+  const enEntries = enPanel.querySelectorAll('.entry');
+  cnEntries.forEach(e => e.remove());
+  enEntries.forEach(e => e.remove());
+  if (!liveCnEl) cnEmpty.style.display = '';
+  if (!liveEnEl) enEmpty.style.display = '';
+});
+
+btnManual.addEventListener('click', sendManual);
+manualInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendManual();
+});
+
+function sendManual() {
+  const text = manualInput.value.trim();
+  if (!text) return;
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'manual_translate', text }));
+    manualInput.value = '';
+  } else {
+    // Open a temporary connection just for manual translation
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const tempWs = new WebSocket(`${protocol}//${location.host}`);
+    tempWs.onopen = () => tempWs.send(JSON.stringify({ type: 'manual_translate', text }));
+    tempWs.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'manual_translation') {
+        addEntry(cnPanel, cnEmpty, msg.cn, true);
+        addEntry(enPanel, enEmpty, msg.en, false);
+        manualInput.value = '';
+        tempWs.close();
+      }
+    };
+    tempWs.onerror = () => showToast('Could not connect to translate. Try starting the mic first.');
+  }
+}
+</script>
+</body>
+</html>
