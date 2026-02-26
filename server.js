@@ -7,7 +7,7 @@ const path = require('path');
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 const PORT = process.env.PORT || 8080;
 
