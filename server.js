@@ -9,7 +9,7 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 const ALIBABA_AK_ID = process.env.ALIBABA_AK_ID || 'LTAI5t74qfgT3PdVegZgTSoV';
 const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET || 'EtkgjYYhFd9YQ9Xej7u1etIVVDQy1Z';
