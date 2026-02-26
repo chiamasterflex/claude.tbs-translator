@@ -578,7 +578,7 @@ function stopAudio() {
 function connectWebSocket() {
   return new Promise((resolve, reject) => {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${location.host}`;
+    const url = `${protocol}//${location.host}/ws`;
     console.log('[WS] Connecting to', url);
 
     ws = new WebSocket(url);
