@@ -3,9 +3,19 @@
   "version": "1.0.0",
   "description": "TBS Live Chinese to English Translator",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+"start": "node server.js",
+"engines": {
+  "node": "18.x"
+}
+```
+
+Actually that's already there. The real issue is different — Railway is stopping the container because the health check fails. 
+
+**Do this instead — go to Railway → your service → Settings → scroll to "Deploy" section → find "Healthcheck Path" and either clear it or set it to `/`**
+
+Also under the same Deploy section, look for **"Start Command"** and make sure it says:
+```
+node server.js
   "dependencies": {
     "axios": "^1.6.0",
     "express": "^4.18.2",
