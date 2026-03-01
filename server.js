@@ -48,7 +48,7 @@ async function fetchAlibabaToken() {
   const params = {
     AccessKeyId: ALIBABA_AK_ID,
     Action: 'CreateToken',
-    Version: '2019-07-17',
+    Version: '2019-02-28',
     Timestamp: timestamp,
     SignatureMethod: 'HMAC-SHA1',
     SignatureVersion: '1.0',
@@ -69,7 +69,7 @@ async function fetchAlibabaToken() {
     .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
 
   const response = await axios.post(
-    `https://nlsmeta.cn-shanghai.aliyuncs.com?${qs}`,
+    `https://nlsmeta.ap-southeast-1.aliyuncs.com?${qs}`,
     null,
     { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
   );
@@ -139,7 +139,7 @@ wss.on('connection', async (clientWs) => {
     console.log('[Alibaba] Token obtained');
 
     alibabaWs = new WebSocket(
-      `wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1?token=${token}`
+      `wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1?token=${token}`
     );
 
     alibabaWs.on('open', () => {
