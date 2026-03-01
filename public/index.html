@@ -35,7 +35,6 @@
     overflow-x: hidden;
   }
 
-  /* Subtle lotus pattern background */
   body::before {
     content: '';
     position: fixed;
@@ -54,7 +53,6 @@
     z-index: 1;
   }
 
-  /* HEADER */
   header {
     text-align: center;
     padding: 24px 0 20px;
@@ -80,7 +78,6 @@
     text-transform: uppercase;
   }
 
-  /* CONTROLS */
   .controls {
     display: flex;
     align-items: center;
@@ -152,7 +149,6 @@
     color: var(--gold);
   }
 
-  /* STATUS */
   .status-bar {
     display: flex;
     align-items: center;
@@ -190,7 +186,6 @@
     50% { opacity: 0.4; }
   }
 
-  /* PANELS */
   .panels {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -230,7 +225,7 @@
     overflow-y: auto;
     padding: 16px;
     display: flex;
-    flex-direction: column-reverse;
+    flex-direction: column;
     gap: 0;
     scroll-behavior: smooth;
   }
@@ -243,7 +238,6 @@
   .panel-body::-webkit-scrollbar-track { background: transparent; }
   .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  /* ENTRIES */
   .entry {
     padding: 10px 0;
     border-bottom: 1px solid rgba(255,255,255,0.05);
@@ -269,7 +263,6 @@
     to { opacity: 1; transform: translateY(0); }
   }
 
-  /* LIVE TEXT */
   .live-text {
     padding: 10px 12px;
     border-radius: 8px;
@@ -293,7 +286,6 @@
     font-style: italic;
   }
 
-  /* COPY BUTTON */
   .btn-copy {
     background: none;
     border: 1px solid var(--border);
@@ -311,7 +303,6 @@
   .btn-copy:hover { border-color: var(--gold-dim); color: var(--gold); }
   .btn-copy.copied { border-color: var(--green); color: var(--green); }
 
-  /* EMPTY STATE */
   .empty-state {
     text-align: center;
     color: var(--text-dim);
@@ -320,7 +311,6 @@
     font-style: italic;
   }
 
-  /* MANUAL INPUT */
   .manual-section {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -382,7 +372,6 @@
   .btn-translate:hover { opacity: 0.9; transform: translateY(-1px); }
   .btn-translate:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
-  /* ERROR TOAST */
   .toast {
     position: fixed;
     bottom: 24px;
@@ -408,7 +397,6 @@
     to { opacity: 1; transform: translateX(-50%) translateY(0); }
   }
 
-  /* MIC ANIMATION */
   .mic-icon { font-size: 1.1rem; }
   .mic-icon.recording { animation: micPulse 1s infinite; }
   @keyframes micPulse {
@@ -464,61 +452,61 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// ─── STATE ───────────────────────────────────────────────────────────────────
+// ─── STATE ────────────────────────────────────────────────────────────────────
 let ws = null;
 let audioContext = null;
 let mediaStream = null;
-let scriptProcessor = null;
-let audioSource = null;
+let audioWorkletNode = null;
 let isRecording = false;
 let liveCnEl = null;
 let liveEnEl = null;
 
-// ─── ELEMENTS ────────────────────────────────────────────────────────────────
-const btnStart   = document.getElementById('btnStart');
-const btnText    = document.getElementById('btnText');
-const micIcon    = document.getElementById('micIcon');
-const btnClear   = document.getElementById('btnClear');
-const btnManual  = document.getElementById('btnManual');
-const statusDot  = document.getElementById('statusDot');
-const statusText = document.getElementById('statusText');
-const cnPanel    = document.getElementById('cnPanel');
-const enPanel    = document.getElementById('enPanel');
-const cnEmpty    = document.getElementById('cnEmpty');
-const enEmpty    = document.getElementById('enEmpty');
+// ─── ELEMENTS ─────────────────────────────────────────────────────────────────
+const btnStart    = document.getElementById('btnStart');
+const btnText     = document.getElementById('btnText');
+const micIcon     = document.getElementById('micIcon');
+const btnClear    = document.getElementById('btnClear');
+const btnManual   = document.getElementById('btnManual');
+const statusDot   = document.getElementById('statusDot');
+const statusText  = document.getElementById('statusText');
+const cnPanel     = document.getElementById('cnPanel');
+const enPanel     = document.getElementById('enPanel');
+const cnEmpty     = document.getElementById('cnEmpty');
+const enEmpty     = document.getElementById('enEmpty');
 const manualInput = document.getElementById('manualInput');
-const toast      = document.getElementById('toast');
+const toast       = document.getElementById('toast');
 
-// ─── STATUS ──────────────────────────────────────────────────────────────────
+// ─── STATUS ───────────────────────────────────────────────────────────────────
 function setStatus(state, text) {
   statusDot.className = 'status-dot ' + state;
   statusText.textContent = text;
 }
 
-// ─── TOAST ───────────────────────────────────────────────────────────────────
+// ─── TOAST ────────────────────────────────────────────────────────────────────
 function showToast(msg) {
   toast.textContent = msg;
   toast.classList.add('show');
   setTimeout(() => toast.classList.remove('show'), 4000);
 }
 
-// ─── PANEL HELPERS ───────────────────────────────────────────────────────────
+// ─── PANEL HELPERS ────────────────────────────────────────────────────────────
+function scrollToBottom(panel) {
+  panel.scrollTop = panel.scrollHeight;
+}
+
 function removeLiveEl(panel, el) {
-  if (el && el.parentNode === panel) {
-    panel.removeChild(el);
-  }
+  if (el && el.parentNode === panel) panel.removeChild(el);
 }
 
 function addEntry(panel, emptyEl, text, isCn) {
   emptyEl.style.display = 'none';
 
+  const div = document.createElement('div');
+
   if (isCn) {
-    const div = document.createElement('div');
     div.className = 'entry';
     div.textContent = text;
-    panel.appendChild(div);
   } else {
-    const div = document.createElement('div');
     div.className = 'entry en-entry';
     const span = document.createElement('span');
     span.className = 'entry-text';
@@ -535,66 +523,103 @@ function addEntry(panel, emptyEl, text, isCn) {
     };
     div.appendChild(span);
     div.appendChild(btn);
-    panel.appendChild(div);
   }
+
+  panel.appendChild(div);
+  scrollToBottom(panel);
 }
 
-// ─── AUDIO CAPTURE ───────────────────────────────────────────────────────────
-function convertFloat32ToPCM16(float32Array) {
-  const pcm16 = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+// ─── AUDIO WORKLET PROCESSOR (inline as blob) ─────────────────────────────────
+// ✅ Uses AudioWorklet instead of deprecated ScriptProcessor
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input[0]) {
+      const float32 = input[0];
+      const pcm16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+    }
+    return true;
   }
-  return pcm16;
 }
+registerProcessor('pcm-processor', PCMProcessor);
+`;
 
 async function startAudio() {
   mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+    audio: {
+      channelCount: 1,
+      sampleRate: 16000,
+      echoCancellation: true,
+      noiseSuppression: true
+    }
   });
-  audioContext = new AudioContext({ sampleRate: 16000 });
-  audioSource = audioContext.createMediaStreamSource(mediaStream);
-  scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
 
-  scriptProcessor.onaudioprocess = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const pcm = convertFloat32ToPCM16(e.inputBuffer.getChannelData(0));
-    ws.send(pcm.buffer);
+  audioContext = new AudioContext({ sampleRate: 16000 });
+
+  // Load worklet from blob URL
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const blobURL = URL.createObjectURL(blob);
+  await audioContext.audioWorklet.addModule(blobURL);
+  URL.revokeObjectURL(blobURL);
+
+  const source = audioContext.createMediaStreamSource(mediaStream);
+  audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+
+  audioWorkletNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data);
+    }
   };
 
-  audioSource.connect(scriptProcessor);
-  scriptProcessor.connect(audioContext.destination);
+  source.connect(audioWorkletNode);
+  audioWorkletNode.connect(audioContext.destination);
 }
 
 function stopAudio() {
-  if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
-  if (audioSource) { audioSource.disconnect(); audioSource = null; }
+  if (audioWorkletNode) { audioWorkletNode.disconnect(); audioWorkletNode = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
 }
 
-// ─── WEBSOCKET ───────────────────────────────────────────────────────────────
+// ─── WEBSOCKET ────────────────────────────────────────────────────────────────
+function getWsUrl() {
+  // ✅ Fixed: always use /ws path
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/ws`;
+}
+
 function connectWebSocket() {
   return new Promise((resolve, reject) => {
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${location.host}/ws`;
+    const url = getWsUrl();
     console.log('[WS] Connecting to', url);
 
     ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
 
+    const timeout = setTimeout(() => {
+      reject(new Error('Connection timeout after 10s'));
+    }, 10000);
+
     ws.onopen = () => {
+      clearTimeout(timeout);
       console.log('[WS] Connected');
       resolve();
     };
 
     ws.onerror = (err) => {
+      clearTimeout(timeout);
       console.error('[WS] Error', err);
       reject(new Error('WebSocket connection failed'));
     };
 
     ws.onclose = () => {
+      clearTimeout(timeout);
       console.log('[WS] Closed');
       if (isRecording) {
         setStatus('error', 'Disconnected');
@@ -617,11 +642,10 @@ function connectWebSocket() {
           cnPanel.appendChild(liveCnEl);
         }
         liveCnEl.textContent = msg.text;
+        scrollToBottom(cnPanel);
 
       } else if (msg.type === 'translating') {
-        // Commit the Chinese, show "translating" in EN panel
-        removeLiveEl(cnPanel, liveCnEl);
-        liveCnEl = null;
+        removeLiveEl(cnPanel, liveCnEl); liveCnEl = null;
         addEntry(cnPanel, cnEmpty, msg.cn, true);
 
         enEmpty.style.display = 'none';
@@ -631,16 +655,11 @@ function connectWebSocket() {
           enPanel.appendChild(liveEnEl);
         }
         liveEnEl.textContent = 'Translating...';
+        scrollToBottom(enPanel);
 
       } else if (msg.type === 'final') {
-        // Commit to both panels
         removeLiveEl(cnPanel, liveCnEl); liveCnEl = null;
         removeLiveEl(enPanel, liveEnEl); liveEnEl = null;
-
-        // Only add CN entry if not already added via 'translating'
-        if (!document.querySelector('#cnPanel .entry:last-child')?.textContent === msg.cn) {
-          addEntry(cnPanel, cnEmpty, msg.cn, true);
-        }
         addEntry(enPanel, enEmpty, msg.en, false);
 
       } else if (msg.type === 'manual_translation') {
@@ -652,13 +671,10 @@ function connectWebSocket() {
         setStatus('error', 'Error');
       }
     };
-
-    // Timeout if no connection in 10s
-    setTimeout(() => reject(new Error('Connection timeout')), 10000);
   });
 }
 
-// ─── RECORDING CONTROL ───────────────────────────────────────────────────────
+// ─── RECORDING CONTROL ────────────────────────────────────────────────────────
 async function startRecording() {
   btnStart.disabled = true;
   setStatus('connecting', 'Connecting...');
@@ -695,8 +711,6 @@ function stopRecording(sendStop = true) {
   }
 
   stopAudio();
-
-  // Clean up live elements
   removeLiveEl(cnPanel, liveCnEl); liveCnEl = null;
   removeLiveEl(enPanel, liveEnEl); liveEnEl = null;
 
@@ -708,38 +722,17 @@ function stopRecording(sendStop = true) {
   setStatus('', 'Stopped');
 }
 
-// ─── EVENT LISTENERS ─────────────────────────────────────────────────────────
-btnStart.addEventListener('click', () => {
-  if (isRecording) { stopRecording(true); }
-  else { startRecording(); }
-});
-
-btnClear.addEventListener('click', () => {
-  // Keep live elements, remove committed entries
-  const cnEntries = cnPanel.querySelectorAll('.entry');
-  const enEntries = enPanel.querySelectorAll('.entry');
-  cnEntries.forEach(e => e.remove());
-  enEntries.forEach(e => e.remove());
-  if (!liveCnEl) cnEmpty.style.display = '';
-  if (!liveEnEl) enEmpty.style.display = '';
-});
-
-btnManual.addEventListener('click', sendManual);
-manualInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendManual();
-});
-
+// ─── MANUAL TRANSLATE ─────────────────────────────────────────────────────────
 function sendManual() {
   const text = manualInput.value.trim();
   if (!text) return;
 
+  // ✅ Fixed: always use /ws path for manual translate too
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'manual_translate', text }));
     manualInput.value = '';
   } else {
-    // Open a temporary connection just for manual translation
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const tempWs = new WebSocket(`${protocol}//${location.host}`);
+    const tempWs = new WebSocket(getWsUrl());
     tempWs.onopen = () => tempWs.send(JSON.stringify({ type: 'manual_translate', text }));
     tempWs.onmessage = (event) => {
       const msg = JSON.parse(event.data);
@@ -750,9 +743,29 @@ function sendManual() {
         tempWs.close();
       }
     };
-    tempWs.onerror = () => showToast('Could not connect to translate. Try starting the mic first.');
+    tempWs.onerror = () => showToast('Could not connect. Try starting the mic first.');
   }
 }
+
+// ─── EVENT LISTENERS ──────────────────────────────────────────────────────────
+btnStart.addEventListener('click', () => {
+  if (isRecording) stopRecording(true);
+  else startRecording();
+});
+
+btnClear.addEventListener('click', () => {
+  cnPanel.querySelectorAll('.entry, .live-text').forEach(e => e.remove());
+  enPanel.querySelectorAll('.entry, .live-text').forEach(e => e.remove());
+  liveCnEl = null;
+  liveEnEl = null;
+  cnEmpty.style.display = '';
+  enEmpty.style.display = '';
+});
+
+btnManual.addEventListener('click', sendManual);
+manualInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendManual();
+});
 </script>
 </body>
 </html>
