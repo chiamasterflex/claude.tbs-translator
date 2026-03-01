@@ -69,7 +69,7 @@ async function fetchAlibabaToken() {
     .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
 
   const response = await axios.post(
-    `https://nlsmeta.ap-southeast-1.aliyuncs.com?${qs}`,
+    `https://nlsmeta.cn-shanghai.aliyuncs.com?${qs}`,
     null,
     { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
   );
@@ -139,7 +139,7 @@ wss.on('connection', async (clientWs) => {
     console.log('[Alibaba] Token obtained');
 
     alibabaWs = new WebSocket(
-      `wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1?token=${token}`
+      `wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1?token=${token}`
     );
 
     alibabaWs.on('open', () => {
