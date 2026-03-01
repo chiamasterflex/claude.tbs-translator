@@ -9,16 +9,32 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-const PORT = process.env.PORT || 8080; ```  **Then in Railway Variables, add:** ``` PORT = 8080
+const PORT = process.env.PORT || 8080;
 
-const ALIBABA_AK_ID = process.env.ALIBABA_AK_ID || 'LTAI5t74qfgT3PdVegZgTSoV';
-const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET || 'EtkgjYYhFd9YQ9Xej7u1etIVVDQy1Z';
-const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY || 'kNPPGUGiUNqBa7DB';
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || 'sk-43a90c6020b44e818013a112dd890b79';
+// ✅ SAFE: Keys only from environment variables — never hardcoded
+const ALIBABA_AK_ID     = process.env.ALIBABA_AK_ID;
+const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET;
+const ALIBABA_APPKEY    = process.env.ALIBABA_APPKEY;
+const DEEPSEEK_API_KEY  = process.env.DEEPSEEK_API_KEY;
+
+// Validate all required env vars are present at startup
+const missingVars = [];
+if (!ALIBABA_AK_ID)     missingVars.push('ALIBABA_AK_ID');
+if (!ALIBABA_AK_SECRET) missingVars.push('ALIBABA_AK_SECRET');
+if (!ALIBABA_APPKEY)    missingVars.push('ALIBABA_APPKEY');
+if (!DEEPSEEK_API_KEY)  missingVars.push('DEEPSEEK_API_KEY');
+
+if (missingVars.length > 0) {
+  console.error('[Config] ❌ Missing environment variables:', missingVars.join(', '));
+  console.error('[Config] Please set these in Railway Variables tab.');
+  process.exit(1);
+}
+
+console.log('[Config] ✅ All environment variables loaded');
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- ALIBABA TOKEN ---
+// ─── ALIBABA TOKEN ────────────────────────────────────────────────────────────
 function percentEncode(str) {
   return encodeURIComponent(String(str))
     .replace(/!/g, '%21').replace(/'/g, '%27')
@@ -64,7 +80,7 @@ async function fetchAlibabaToken() {
   return response.data.Token.Id;
 }
 
-// --- DEEPSEEK TRANSLATION ---
+// ─── DEEPSEEK TRANSLATION ─────────────────────────────────────────────────────
 async function translateWithDeepSeek(chineseText) {
   const response = await axios.post(
     'https://api.deepseek.com/chat/completions',
@@ -73,9 +89,9 @@ async function translateWithDeepSeek(chineseText) {
       messages: [
         {
           role: 'system',
-          content: `You are the official translator for True Buddha School (TBS). 
-Translate Chinese to English. 
-Rules: 
+          content: `You are the official translator for True Buddha School (TBS).
+Translate Chinese to English.
+Rules:
 1. Output ONLY the English translation, nothing else. No explanations, no notes.
 2. Key terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master, 真佛宗=True Buddha School, 法王=Dharma King, 盧勝彥=Lu Sheng-yen, 師母=Holy Consort.
 3. Keep proper nouns and Sanskrit terms unchanged.
@@ -97,14 +113,13 @@ Rules:
   return response.data.choices[0].message.content.trim();
 }
 
-// --- WEBSOCKET SERVER ---
+// ─── WEBSOCKET SERVER ─────────────────────────────────────────────────────────
 wss.on('connection', async (clientWs) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
   let alibabaReady = false;
   const taskId = crypto.randomUUID();
-  // Buffer audio that arrives before Alibaba is ready
   const audioBuffer = [];
 
   function safeSend(ws, data) {
@@ -117,7 +132,7 @@ wss.on('connection', async (clientWs) => {
     }
   }
 
-  // Connect to Alibaba
+  // Connect to Alibaba ASR
   try {
     console.log('[Alibaba] Fetching token...');
     const token = await fetchAlibabaToken();
@@ -157,7 +172,6 @@ wss.on('connection', async (clientWs) => {
       if (eventName === 'TranscriptionStarted') {
         console.log('[Alibaba] Transcriber ready');
         alibabaReady = true;
-        // Flush any buffered audio
         while (audioBuffer.length > 0) {
           const chunk = audioBuffer.shift();
           safeSend(alibabaWs, chunk);
@@ -207,20 +221,17 @@ wss.on('connection', async (clientWs) => {
 
   // Handle messages from browser
   clientWs.on('message', async (data) => {
-    // Binary = audio data
     if (Buffer.isBuffer(data)) {
       if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
         if (alibabaReady) {
           alibabaWs.send(data);
         } else {
-          // Buffer until ready (max 100 chunks)
           if (audioBuffer.length < 100) audioBuffer.push(data);
         }
       }
       return;
     }
 
-    // JSON messages
     let message;
     try { message = JSON.parse(data.toString()); } catch (e) { return; }
 
@@ -270,6 +281,6 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] TBS Live Translator running on port ${PORT}`);
 });
