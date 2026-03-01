@@ -45,6 +45,7 @@ async function fetchAlibabaToken() {
     AccessKeyId: ALIBABA_AK_ID,
     Action: 'CreateToken',
     Version: '2019-02-28',
+    RegionId: 'ap-southeast-1',
     Timestamp: timestamp,
     SignatureMethod: 'HMAC-SHA1',
     SignatureVersion: '1.0',
@@ -52,7 +53,6 @@ async function fetchAlibabaToken() {
     Format: 'JSON'
   };
 
-  // Use GET method for Alibaba token endpoint
   const sortedKeys = Object.keys(params).sort();
   const canonicalizedQuery = sortedKeys
     .map(k => `${percentEncode(k)}=${percentEncode(params[k])}`).join('&');
