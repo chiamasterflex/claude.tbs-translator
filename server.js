@@ -17,8 +17,9 @@ const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
 const ALIBABA_TOKEN = process.env.ALIBABA_TOKEN; // temporary token (24h)
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-// Alibaba endpoint (keep as the one that worked for you previously)
-const ALIBABA_WS_BASE = 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
+// Allow override via env. Default matches your working endpoint.
+const ALIBABA_WS_BASE =
+  process.env.ALIBABA_WS_BASE || 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
 
 function requireEnv(name, val) {
   if (!val) throw new Error(`[Startup] Missing env var: ${name}`);
@@ -40,6 +41,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Listening on ${PORT}`);
+  console.log(`[Config] ALIBABA_WS_BASE=${ALIBABA_WS_BASE}`);
 });
 
 // WebSocket server on /ws
@@ -78,42 +80,51 @@ async function translateWithDeepSeek(cn) {
   return out;
 }
 
-wss.on('connection', (clientWs, req) => {
+wss.on('connection', (clientWs) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
-  let alibabaReady = false; // informational only (from TranscriptionStarted)
+  let alibabaReady = false;
+  let startSentAt = 0;
+  let forcedReadyTimer = null;
 
-  // NEW: track handshake state to avoid deadlock
-  let startSent = false;
-
-  // Buffer audio until Alibaba socket is open and StartTranscriber has been sent
+  // Buffer audio until Alibaba is ready
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-
-  // You can bump this to 5 seconds if you want fewer “first words” drops
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds PCM16 mono 16k
+  const MAX_BUFFER_BYTES = 16000 * 2 * 4; // ~4 seconds PCM16 mono 16k
 
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
 
   const taskId = newId();
 
-  function flushBufferedAudio() {
-    if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) return;
-    if (!startSent) return;
-
-    if (bufferedBytes > 0) {
-      console.log('[Alibaba] Flushing buffered audio:', bufferedBytes, 'bytes');
+  function clearForcedReadyTimer() {
+    if (forcedReadyTimer) {
+      clearTimeout(forcedReadyTimer);
+      forcedReadyTimer = null;
     }
-    while (audioBufferQueue.length && alibabaWs.readyState === WebSocket.OPEN) {
+  }
+
+  function setReadyAndFlush(reason) {
+    if (alibabaReady) return;
+    alibabaReady = true;
+    clearForcedReadyTimer();
+
+    console.log(`[Alibaba] READY (${reason}). Flushing buffered audio: ${bufferedBytes} bytes`);
+    safeJsonSend(clientWs, { type: 'status', status: 'ready', reason });
+
+    while (audioBufferQueue.length) {
       const chunk = audioBufferQueue.shift();
       bufferedBytes -= chunk.length;
-      alibabaWs.send(chunk);
+      if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
+        alibabaWs.send(chunk);
+      }
     }
   }
 
   function closeAlibaba() {
+    clearForcedReadyTimer();
+
     if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
       try {
         const stop = {
@@ -129,12 +140,13 @@ wss.on('connection', (clientWs, req) => {
         alibabaWs.send(JSON.stringify(stop));
       } catch (_) {}
     }
+
     try {
       alibabaWs?.close();
     } catch (_) {}
+
     alibabaWs = null;
     alibabaReady = false;
-    startSent = false;
   }
 
   function connectAlibabaIfNeeded() {
@@ -147,6 +159,7 @@ wss.on('connection', (clientWs, req) => {
 
     alibabaWs.on('open', () => {
       console.log('[Alibaba] WS open');
+      startSentAt = Date.now();
 
       const start = {
         header: {
@@ -166,11 +179,16 @@ wss.on('connection', (clientWs, req) => {
       };
 
       alibabaWs.send(JSON.stringify(start));
-      startSent = true;
 
-      // IMPORTANT: do NOT wait for TranscriptionStarted
-      // Alibaba may not emit it until it receives audio.
-      flushBufferedAudio();
+      // Some setups don’t fire TranscriptionStarted reliably.
+      // If we don’t see a start-ish event quickly, force ready so audio flows.
+      clearForcedReadyTimer();
+      forcedReadyTimer = setTimeout(() => {
+        // Only force-ready if still connected and not ready.
+        if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN && !alibabaReady) {
+          setReadyAndFlush('forced_after_1500ms');
+        }
+      }, 1500);
     });
 
     alibabaWs.on('message', async (data) => {
@@ -183,15 +201,21 @@ wss.on('connection', (clientWs, req) => {
       }
 
       const eventName = msg?.header?.name;
+      const statusCode = msg?.header?.status_code;
+      const statusMsg = msg?.header?.status_message;
 
-      if (eventName === 'TranscriptionStarted') {
-        alibabaReady = true;
-        console.log('[Alibaba] TranscriptionStarted');
+      // ALWAYS log events so we know what Alibaba is doing.
+      console.log(
+        `[Alibaba] Event=${eventName || 'UNKNOWN'} status=${statusCode ?? 'n/a'} msg=${statusMsg || ''}`
+      );
 
-        safeJsonSend(clientWs, { type: 'status', status: 'ready' });
-
-        // In case anything arrived between open->start and now
-        flushBufferedAudio();
+      // Common “start” markers (depends on product/version/region)
+      if (
+        eventName === 'TranscriptionStarted' ||
+        eventName === 'TaskStarted' ||
+        eventName === 'StartTranscriberSucceeded'
+      ) {
+        setReadyAndFlush(eventName);
       }
 
       if (eventName === 'TranscriptionResultChanged') {
@@ -213,19 +237,27 @@ wss.on('connection', (clientWs, req) => {
       }
 
       if (eventName === 'TaskFailed') {
-        console.error('[Alibaba] TaskFailed:', msg?.header?.status_message || msg?.header);
+        console.error('[Alibaba] TaskFailed:', statusMsg || msg?.header);
         safeJsonSend(clientWs, {
           type: 'error',
-          message: `Alibaba task failed: ${msg?.header?.status_message || 'unknown'}`,
+          message: `Alibaba task failed: ${statusMsg || 'unknown'}`,
         });
         closeAlibaba();
+      }
+
+      // If Alibaba returns an error status on any message, surface it.
+      if (typeof statusCode === 'number' && statusCode !== 0 && eventName !== 'TaskFailed') {
+        safeJsonSend(clientWs, {
+          type: 'error',
+          message: `Alibaba status error: ${statusMsg || `code ${statusCode}`}`,
+        });
       }
     });
 
     alibabaWs.on('close', (code, reason) => {
       console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
+      clearForcedReadyTimer();
       alibabaReady = false;
-      startSent = false;
       alibabaWs = null;
     });
 
@@ -239,7 +271,7 @@ wss.on('connection', (clientWs, req) => {
   clientWs.on('message', async (data, isBinary) => {
     // Binary audio
     if (isBinary) {
-      const buf = Buffer.from(data); // ensure Node Buffer
+      const buf = Buffer.from(data);
       lastAudioAt = Date.now();
 
       if (!hasSeenAnyAudio) {
@@ -247,27 +279,28 @@ wss.on('connection', (clientWs, req) => {
         console.log('[Audio] First audio chunk:', buf.length, 'bytes');
       }
 
-      // Start Alibaba only when first audio arrives
       connectAlibabaIfNeeded();
 
-      // Buffer until Alibaba WS is open + StartTranscriber is sent
-      if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN || !startSent) {
+      // If Alibaba not ready yet, buffer
+      if (!alibabaReady) {
         if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
+          audioBufferQueue.push(buf);
+          bufferedBytes += buf.length;
+        } else {
+          // If buffer is full, drop oldest to keep it “near real-time”
+          while (audioBufferQueue.length && bufferedBytes + buf.length > MAX_BUFFER_BYTES) {
+            const old = audioBufferQueue.shift();
+            bufferedBytes -= old.length;
+          }
           audioBufferQueue.push(buf);
           bufferedBytes += buf.length;
         }
         return;
       }
 
-      // Forward immediately (do NOT wait for TranscriptionStarted)
-      try {
+      // Alibaba ready: forward immediately
+      if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
         alibabaWs.send(buf);
-      } catch (e) {
-        // If anything goes sideways, buffer a bit rather than dropping
-        if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
-          audioBufferQueue.push(buf);
-          bufferedBytes += buf.length;
-        }
       }
       return;
     }
@@ -289,9 +322,21 @@ wss.on('connection', (clientWs, req) => {
         safeJsonSend(clientWs, { type: 'error', message: 'Manual translation failed' });
       }
     }
+
+    // Optional: let the browser request a “stop” so you reliably get SentenceEnd / finalization.
+    if (msg?.type === 'stop') {
+      console.log('[WS] Client requested stop');
+      closeAlibaba();
+      safeJsonSend(clientWs, { type: 'status', status: 'stopped' });
+    }
+
+    // Optional: ping/pong for debugging
+    if (msg?.type === 'ping') {
+      safeJsonSend(clientWs, { type: 'pong', t: Date.now() });
+    }
   });
 
-  // Keep-alive / monitoring: if client is live but no audio for 15s, warn
+  // Monitoring: if client is live but no audio for 15s, warn
   const interval = setInterval(() => {
     if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
 
@@ -299,6 +344,14 @@ wss.on('connection', (clientWs, req) => {
       const silenceMs = Date.now() - lastAudioAt;
       if (silenceMs > 15000) {
         safeJsonSend(clientWs, { type: 'status', status: 'no_audio' });
+      }
+    }
+
+    // If Alibaba connection exists but never became ready after start, call it out.
+    if (alibabaWs && !alibabaReady && startSentAt) {
+      const ms = Date.now() - startSentAt;
+      if (ms > 4000) {
+        safeJsonSend(clientWs, { type: 'status', status: 'waiting_alibaba', ms });
       }
     }
   }, 5000);
