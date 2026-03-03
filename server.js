@@ -11,16 +11,14 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 const PORT = process.env.PORT || 8080;
 
-const ALIBABA_AK_ID     = process.env.ALIBABA_AK_ID;
-const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET;
-const ALIBABA_APPKEY    = process.env.ALIBABA_APPKEY;
-const DEEPSEEK_API_KEY  = process.env.DEEPSEEK_API_KEY;
+const ALIBABA_TOKEN    = process.env.ALIBABA_TOKEN;
+const ALIBABA_APPKEY   = process.env.ALIBABA_APPKEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
 const missingVars = [];
-if (!ALIBABA_AK_ID)     missingVars.push('ALIBABA_AK_ID');
-if (!ALIBABA_AK_SECRET) missingVars.push('ALIBABA_AK_SECRET');
-if (!ALIBABA_APPKEY)    missingVars.push('ALIBABA_APPKEY');
-if (!DEEPSEEK_API_KEY)  missingVars.push('DEEPSEEK_API_KEY');
+if (!ALIBABA_TOKEN)    missingVars.push('ALIBABA_TOKEN');
+if (!ALIBABA_APPKEY)   missingVars.push('ALIBABA_APPKEY');
+if (!DEEPSEEK_API_KEY) missingVars.push('DEEPSEEK_API_KEY');
 
 if (missingVars.length > 0) {
   console.error('[Config] Missing environment variables:', missingVars.join(', '));
@@ -31,57 +29,7 @@ console.log('[Config] All environment variables loaded');
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-function percentEncode(str) {
-  return encodeURIComponent(String(str))
-    .replace(/!/g, '%21').replace(/'/g, '%27')
-    .replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A');
-}
-
-async function fetchAlibabaToken() {
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z/, 'Z');
-  const nonce = crypto.randomBytes(16).toString('hex');
-
-  const params = {
-    AccessKeyId: ALIBABA_AK_ID,
-    Action: 'CreateToken',
-    Version: '2019-02-28',
-    RegionId: 'ap-southeast-1',
-    Timestamp: timestamp,
-    SignatureMethod: 'HMAC-SHA1',
-    SignatureVersion: '1.0',
-    SignatureNonce: nonce,
-    Format: 'JSON'
-  };
-
-  const sortedKeys = Object.keys(params).sort();
-  const canonicalizedQuery = sortedKeys
-    .map(k => `${percentEncode(k)}=${percentEncode(params[k])}`).join('&');
-
-  const stringToSign = `GET&${percentEncode('/')}&${percentEncode(canonicalizedQuery)}`;
-  const hmac = crypto.createHmac('sha1', ALIBABA_AK_SECRET + '&');
-  hmac.update(stringToSign);
-  params.Signature = hmac.digest('base64');
-
-  const qs = Object.keys(params)
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
-
-  const url = `https://nlsmeta.ap-southeast-1.aliyuncs.com/?${qs}`;
-
-  try {
-    const response = await axios.get(url, { timeout: 10000 });
-    console.log('[Alibaba] Token response:', JSON.stringify(response.data));
-    if (!response.data?.Token?.Id) {
-      throw new Error('No token in response: ' + JSON.stringify(response.data));
-    }
-    return response.data.Token.Id;
-  } catch (err) {
-    if (err.response) {
-      console.error('[Alibaba] Token error:', err.response.status, JSON.stringify(err.response.data));
-    }
-    throw err;
-  }
-}
-
+// ─── DEEPSEEK TRANSLATION ─────────────────────────────────────────────────────
 async function translateWithDeepSeek(chineseText) {
   const response = await axios.post(
     'https://api.deepseek.com/chat/completions',
@@ -114,6 +62,7 @@ Rules:
   return response.data.choices[0].message.content.trim();
 }
 
+// ─── WEBSOCKET SERVER ─────────────────────────────────────────────────────────
 wss.on('connection', async (clientWs) => {
   console.log('[WS] Client connected');
 
@@ -131,12 +80,10 @@ wss.on('connection', async (clientWs) => {
   }
 
   try {
-    console.log('[Alibaba] Fetching token...');
-    const token = await fetchAlibabaToken();
-    console.log('[Alibaba] Token obtained');
+    console.log('[Alibaba] Connecting with token...');
 
     alibabaWs = new WebSocket(
-      `wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1?token=${token}`
+      `wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1?token=${ALIBABA_TOKEN}`
     );
 
     alibabaWs.on('open', () => {
