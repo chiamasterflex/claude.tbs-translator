@@ -82,15 +82,36 @@ wss.on('connection', (clientWs, req) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
-  let alibabaReady = false;
+  let alibabaReady = false; // informational only (from TranscriptionStarted)
 
-  // Buffer audio until Alibaba is ready
+  // NEW: track handshake state to avoid deadlock
+  let startSent = false;
+
+  // Buffer audio until Alibaba socket is open and StartTranscriber has been sent
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds of PCM16 mono 16k (16k samples/sec * 2 bytes/sample * 2 sec)
+
+  // You can bump this to 5 seconds if you want fewer “first words” drops
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds PCM16 mono 16k
 
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
+
+  const taskId = newId();
+
+  function flushBufferedAudio() {
+    if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) return;
+    if (!startSent) return;
+
+    if (bufferedBytes > 0) {
+      console.log('[Alibaba] Flushing buffered audio:', bufferedBytes, 'bytes');
+    }
+    while (audioBufferQueue.length && alibabaWs.readyState === WebSocket.OPEN) {
+      const chunk = audioBufferQueue.shift();
+      bufferedBytes -= chunk.length;
+      alibabaWs.send(chunk);
+    }
+  }
 
   function closeAlibaba() {
     if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
@@ -108,12 +129,13 @@ wss.on('connection', (clientWs, req) => {
         alibabaWs.send(JSON.stringify(stop));
       } catch (_) {}
     }
-    try { alibabaWs?.close(); } catch (_) {}
+    try {
+      alibabaWs?.close();
+    } catch (_) {}
     alibabaWs = null;
     alibabaReady = false;
+    startSent = false;
   }
-
-  const taskId = newId();
 
   function connectAlibabaIfNeeded() {
     if (alibabaWs) return;
@@ -144,6 +166,11 @@ wss.on('connection', (clientWs, req) => {
       };
 
       alibabaWs.send(JSON.stringify(start));
+      startSent = true;
+
+      // IMPORTANT: do NOT wait for TranscriptionStarted
+      // Alibaba may not emit it until it receives audio.
+      flushBufferedAudio();
     });
 
     alibabaWs.on('message', async (data) => {
@@ -159,18 +186,12 @@ wss.on('connection', (clientWs, req) => {
 
       if (eventName === 'TranscriptionStarted') {
         alibabaReady = true;
-        console.log('[Alibaba] Ready. Flushing buffered audio:', bufferedBytes, 'bytes');
+        console.log('[Alibaba] TranscriptionStarted');
 
         safeJsonSend(clientWs, { type: 'status', status: 'ready' });
 
-        // Flush buffered audio immediately
-        while (audioBufferQueue.length) {
-          const chunk = audioBufferQueue.shift();
-          bufferedBytes -= chunk.length;
-          if (alibabaWs.readyState === WebSocket.OPEN) {
-            alibabaWs.send(chunk);
-          }
-        }
+        // In case anything arrived between open->start and now
+        flushBufferedAudio();
       }
 
       if (eventName === 'TranscriptionResultChanged') {
@@ -204,6 +225,7 @@ wss.on('connection', (clientWs, req) => {
     alibabaWs.on('close', (code, reason) => {
       console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
       alibabaReady = false;
+      startSent = false;
       alibabaWs = null;
     });
 
@@ -228,8 +250,8 @@ wss.on('connection', (clientWs, req) => {
       // Start Alibaba only when first audio arrives
       connectAlibabaIfNeeded();
 
-      // If Alibaba not ready yet, buffer (up to ~2 sec)
-      if (!alibabaReady) {
+      // Buffer until Alibaba WS is open + StartTranscriber is sent
+      if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN || !startSent) {
         if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
           audioBufferQueue.push(buf);
           bufferedBytes += buf.length;
@@ -237,9 +259,15 @@ wss.on('connection', (clientWs, req) => {
         return;
       }
 
-      // Alibaba ready: forward immediately
-      if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
+      // Forward immediately (do NOT wait for TranscriptionStarted)
+      try {
         alibabaWs.send(buf);
+      } catch (e) {
+        // If anything goes sideways, buffer a bit rather than dropping
+        if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
+          audioBufferQueue.push(buf);
+          bufferedBytes += buf.length;
+        }
       }
       return;
     }
