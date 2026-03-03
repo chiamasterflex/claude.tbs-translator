@@ -1,3 +1,5 @@
+'use strict';
+
 const express = require('express');
 const { WebSocketServer, WebSocket } = require('ws');
 const { createServer } = require('http');
@@ -7,217 +9,280 @@ const path = require('path');
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
 
+// ---- Config (ENV ONLY) ----
 const PORT = process.env.PORT || 8080;
 
-const ALIBABA_TOKEN    = process.env.ALIBABA_TOKEN;
-const ALIBABA_APPKEY   = process.env.ALIBABA_APPKEY;
+const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
+const ALIBABA_TOKEN = process.env.ALIBABA_TOKEN; // temporary token (24h)
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-const missingVars = [];
-if (!ALIBABA_TOKEN)    missingVars.push('ALIBABA_TOKEN');
-if (!ALIBABA_APPKEY)   missingVars.push('ALIBABA_APPKEY');
-if (!DEEPSEEK_API_KEY) missingVars.push('DEEPSEEK_API_KEY');
+// Alibaba endpoint (keep as the one that worked for you previously)
+const ALIBABA_WS_BASE = 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
 
-if (missingVars.length > 0) {
-  console.error('[Config] Missing environment variables:', missingVars.join(', '));
-  process.exit(1);
+function requireEnv(name, val) {
+  if (!val) throw new Error(`[Startup] Missing env var: ${name}`);
 }
+requireEnv('ALIBABA_APPKEY', ALIBABA_APPKEY);
+requireEnv('ALIBABA_TOKEN', ALIBABA_TOKEN);
+requireEnv('DEEPSEEK_API_KEY', DEEPSEEK_API_KEY);
 
-console.log('[Config] All environment variables loaded');
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Alibaba requires message IDs without dashes
 function newId() {
   return crypto.randomUUID().replace(/-/g, '');
 }
 
-async function translateWithDeepSeek(chineseText) {
-  const response = await axios.post(
+function safeJsonSend(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// Serve frontend
+app.use(express.static(path.join(__dirname, 'public')));
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] Listening on ${PORT}`);
+});
+
+// WebSocket server on /ws
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+async function translateWithDeepSeek(cn) {
+  const system = [
+    'You are the official translator for True Buddha School (TBS). Translate Chinese to English.',
+    'Rules:',
+    '1) Output ONLY the English translation, nothing else.',
+    '2) Key terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master, 真佛宗=True Buddha School, 法王=Dharma King.',
+    '3) Keep proper nouns unchanged.',
+  ].join('\n');
+
+  const resp = await axios.post(
     'https://api.deepseek.com/chat/completions',
     {
       model: 'deepseek-chat',
       messages: [
-        {
-          role: 'system',
-          content: `You are the official translator for True Buddha School (TBS).
-Translate Chinese to English.
-Rules:
-1. Output ONLY the English translation, nothing else. No explanations, no notes.
-2. Key terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master, 真佛宗=True Buddha School, 法王=Dharma King, 盧勝彥=Lu Sheng-yen, 師母=Holy Consort.
-3. Keep proper nouns and Sanskrit terms unchanged.
-4. Maintain the reverent tone of Buddhist teachings.`
-        },
-        { role: 'user', content: chineseText }
+        { role: 'system', content: system },
+        { role: 'user', content: cn },
       ],
-      temperature: 0.1,
-      max_tokens: 500
+      temperature: 0.2,
     },
     {
       headers: {
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-        'Content-Type': 'application/json'
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-      timeout: 15000
+      timeout: 30000,
     }
   );
-  return response.data.choices[0].message.content.trim();
+
+  const out = resp.data?.choices?.[0]?.message?.content?.trim();
+  if (!out) throw new Error('DeepSeek returned empty response');
+  return out;
 }
 
-wss.on('connection', async (clientWs) => {
+wss.on('connection', (clientWs, req) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
   let alibabaReady = false;
-  const taskId = newId();
-  const audioBuffer = [];
 
-  function safeSend(ws, data) {
-    try {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
-    } catch (e) {
-      console.error('[WS] safeSend error:', e.message);
+  // Buffer audio until Alibaba is ready
+  const audioBufferQueue = [];
+  let bufferedBytes = 0;
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds of PCM16 mono 16k (16k samples/sec * 2 bytes/sample * 2 sec)
+
+  let hasSeenAnyAudio = false;
+  let lastAudioAt = 0;
+
+  function closeAlibaba() {
+    if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
+      try {
+        const stop = {
+          header: {
+            message_id: newId(),
+            task_id: taskId,
+            namespace: 'SpeechTranscriber',
+            name: 'StopTranscriber',
+            appkey: ALIBABA_APPKEY,
+          },
+          payload: {},
+        };
+        alibabaWs.send(JSON.stringify(stop));
+      } catch (_) {}
     }
+    try { alibabaWs?.close(); } catch (_) {}
+    alibabaWs = null;
+    alibabaReady = false;
   }
 
-  try {
-    console.log('[Alibaba] Connecting with token...');
+  const taskId = newId();
 
-    alibabaWs = new WebSocket(
-      `wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1?token=${ALIBABA_TOKEN}`
-    );
+  function connectAlibabaIfNeeded() {
+    if (alibabaWs) return;
+
+    const url = `${ALIBABA_WS_BASE}?token=${encodeURIComponent(ALIBABA_TOKEN)}`;
+    console.log('[Alibaba] Connecting:', url.replace(ALIBABA_TOKEN, '***TOKEN***'));
+
+    alibabaWs = new WebSocket(url);
 
     alibabaWs.on('open', () => {
-      console.log('[Alibaba] WebSocket connected, starting transcriber...');
-      alibabaWs.send(JSON.stringify({
+      console.log('[Alibaba] WS open');
+
+      const start = {
         header: {
           message_id: newId(),
           task_id: taskId,
           namespace: 'SpeechTranscriber',
           name: 'StartTranscriber',
-          appkey: ALIBABA_APPKEY
+          appkey: ALIBABA_APPKEY,
         },
         payload: {
           format: 'pcm',
           sample_rate: 16000,
           enable_intermediate_result: true,
           enable_punctuation_prediction: true,
-          enable_inverse_text_normalization: true
-        }
-      }));
+          enable_inverse_text_normalization: true,
+        },
+      };
+
+      alibabaWs.send(JSON.stringify(start));
     });
 
     alibabaWs.on('message', async (data) => {
-      let message;
-      try { message = JSON.parse(data.toString()); } catch (e) { return; }
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch (e) {
+        console.log('[Alibaba] Non-JSON message:', data.toString().slice(0, 200));
+        return;
+      }
 
-      const eventName = message.header?.name;
-      console.log('[Alibaba] Event:', eventName);
+      const eventName = msg?.header?.name;
 
       if (eventName === 'TranscriptionStarted') {
-        console.log('[Alibaba] Transcriber ready');
         alibabaReady = true;
-        while (audioBuffer.length > 0) {
-          safeSend(alibabaWs, audioBuffer.shift());
-        }
-        safeSend(clientWs, JSON.stringify({ type: 'status', status: 'live' }));
+        console.log('[Alibaba] Ready. Flushing buffered audio:', bufferedBytes, 'bytes');
 
-      } else if (eventName === 'TranscriptionResultChanged') {
-        const result = message.payload?.result;
-        if (result) safeSend(clientWs, JSON.stringify({ type: 'live_cn', text: result }));
+        safeJsonSend(clientWs, { type: 'status', status: 'ready' });
 
-      } else if (eventName === 'SentenceEnd') {
-        const result = message.payload?.result;
-        if (result && result.trim().length >= 2) {
-          safeSend(clientWs, JSON.stringify({ type: 'translating', cn: result }));
-          try {
-            const translation = await translateWithDeepSeek(result);
-            safeSend(clientWs, JSON.stringify({ type: 'final', cn: result, en: translation }));
-          } catch (err) {
-            console.error('[DeepSeek] Translation error:', err.message);
-            safeSend(clientWs, JSON.stringify({ type: 'final', cn: result, en: '[Translation error]' }));
+        // Flush buffered audio immediately
+        while (audioBufferQueue.length) {
+          const chunk = audioBufferQueue.shift();
+          bufferedBytes -= chunk.length;
+          if (alibabaWs.readyState === WebSocket.OPEN) {
+            alibabaWs.send(chunk);
           }
         }
+      }
 
-      } else if (eventName === 'TaskFailed') {
-        const statusCode = message.header?.status;
-        const msg = message.header?.status_text || message.header?.status_message || 'Unknown error';
-        console.error('[Alibaba] Task failed:', statusCode, msg);
-        console.error('[Alibaba] Full message:', JSON.stringify(message));
-        safeSend(clientWs, JSON.stringify({ type: 'error', message: `ASR failed: ${msg}` }));
+      if (eventName === 'TranscriptionResultChanged') {
+        const result = msg?.payload?.result;
+        if (result) safeJsonSend(clientWs, { type: 'live_cn', text: result });
+      }
+
+      if (eventName === 'SentenceEnd') {
+        const result = msg?.payload?.result;
+        if (result && result.trim().length >= 1) {
+          try {
+            const en = await translateWithDeepSeek(result);
+            safeJsonSend(clientWs, { type: 'final', cn: result, en });
+          } catch (err) {
+            console.error('[DeepSeek] Translate error:', err?.message || err);
+            safeJsonSend(clientWs, { type: 'error', message: 'Translation failed' });
+          }
+        }
+      }
+
+      if (eventName === 'TaskFailed') {
+        console.error('[Alibaba] TaskFailed:', msg?.header?.status_message || msg?.header);
+        safeJsonSend(clientWs, {
+          type: 'error',
+          message: `Alibaba task failed: ${msg?.header?.status_message || 'unknown'}`,
+        });
+        closeAlibaba();
       }
     });
 
-    alibabaWs.on('error', (err) => {
-      console.error('[Alibaba] WebSocket error:', err.message);
-      safeSend(clientWs, JSON.stringify({ type: 'error', message: 'ASR connection error' }));
-    });
-
     alibabaWs.on('close', (code, reason) => {
-      console.log('[Alibaba] WebSocket closed:', code, reason.toString());
+      console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
       alibabaReady = false;
+      alibabaWs = null;
     });
 
-  } catch (err) {
-    console.error('[Alibaba] Setup error:', err.message);
-    safeSend(clientWs, JSON.stringify({ type: 'error', message: 'Failed to connect to ASR: ' + err.message }));
+    alibabaWs.on('error', (err) => {
+      console.error('[Alibaba] WS error:', err?.message || err);
+      safeJsonSend(clientWs, { type: 'error', message: 'Alibaba WS error' });
+    });
   }
 
-  clientWs.on('message', async (data) => {
-    if (Buffer.isBuffer(data)) {
+  // Client messages: binary audio or JSON commands
+  clientWs.on('message', async (data, isBinary) => {
+    // Binary audio
+    if (isBinary) {
+      const buf = Buffer.from(data); // ensure Node Buffer
+      lastAudioAt = Date.now();
+
+      if (!hasSeenAnyAudio) {
+        hasSeenAnyAudio = true;
+        console.log('[Audio] First audio chunk:', buf.length, 'bytes');
+      }
+
+      // Start Alibaba only when first audio arrives
+      connectAlibabaIfNeeded();
+
+      // If Alibaba not ready yet, buffer (up to ~2 sec)
+      if (!alibabaReady) {
+        if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
+          audioBufferQueue.push(buf);
+          bufferedBytes += buf.length;
+        }
+        return;
+      }
+
+      // Alibaba ready: forward immediately
       if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
-        if (alibabaReady) alibabaWs.send(data);
-        else if (audioBuffer.length < 100) audioBuffer.push(data);
+        alibabaWs.send(buf);
       }
       return;
     }
 
-    let message;
-    try { message = JSON.parse(data.toString()); } catch (e) { return; }
+    // Text message: JSON command
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      return;
+    }
 
-    if (message.type === 'manual_translate') {
-      const text = message.text?.trim();
-      if (!text) return;
+    if (msg?.type === 'manual_translate' && typeof msg?.text === 'string') {
       try {
-        const translation = await translateWithDeepSeek(text);
-        safeSend(clientWs, JSON.stringify({ type: 'manual_translation', cn: text, en: translation }));
+        const en = await translateWithDeepSeek(msg.text);
+        safeJsonSend(clientWs, { type: 'manual_result', cn: msg.text, en });
       } catch (err) {
-        safeSend(clientWs, JSON.stringify({ type: 'error', message: 'Manual translation failed' }));
-      }
-
-    } else if (message.type === 'stop') {
-      if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
-        try {
-          alibabaWs.send(JSON.stringify({
-            header: {
-              message_id: newId(),
-              task_id: taskId,
-              namespace: 'SpeechTranscriber',
-              name: 'StopTranscriber',
-              appkey: ALIBABA_APPKEY
-            }
-          }));
-        } catch (e) { }
+        console.error('[DeepSeek] Manual translate error:', err?.message || err);
+        safeJsonSend(clientWs, { type: 'error', message: 'Manual translation failed' });
       }
     }
   });
 
+  // Keep-alive / monitoring: if client is live but no audio for 15s, warn
+  const interval = setInterval(() => {
+    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
+
+    if (hasSeenAnyAudio) {
+      const silenceMs = Date.now() - lastAudioAt;
+      if (silenceMs > 15000) {
+        safeJsonSend(clientWs, { type: 'status', status: 'no_audio' });
+      }
+    }
+  }, 5000);
+
   clientWs.on('close', () => {
+    clearInterval(interval);
     console.log('[WS] Client disconnected');
-    if (alibabaWs) { try { alibabaWs.close(); } catch (e) { } }
+    closeAlibaba();
   });
 
   clientWs.on('error', (err) => {
-    console.error('[WS] Client error:', err.message);
+    console.error('[WS] Client error:', err?.message || err);
+    closeAlibaba();
   });
-});
-
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] TBS Live Translator running on port ${PORT}`);
 });
