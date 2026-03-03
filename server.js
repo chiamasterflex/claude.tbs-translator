@@ -29,7 +29,11 @@ console.log('[Config] All environment variables loaded');
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── DEEPSEEK TRANSLATION ─────────────────────────────────────────────────────
+// Alibaba requires message IDs without dashes
+function newId() {
+  return crypto.randomUUID().replace(/-/g, '');
+}
+
 async function translateWithDeepSeek(chineseText) {
   const response = await axios.post(
     'https://api.deepseek.com/chat/completions',
@@ -62,13 +66,12 @@ Rules:
   return response.data.choices[0].message.content.trim();
 }
 
-// ─── WEBSOCKET SERVER ─────────────────────────────────────────────────────────
 wss.on('connection', async (clientWs) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
   let alibabaReady = false;
-  const taskId = crypto.randomUUID();
+  const taskId = newId();
   const audioBuffer = [];
 
   function safeSend(ws, data) {
@@ -90,7 +93,7 @@ wss.on('connection', async (clientWs) => {
       console.log('[Alibaba] WebSocket connected, starting transcriber...');
       alibabaWs.send(JSON.stringify({
         header: {
-          message_id: crypto.randomUUID(),
+          message_id: newId(),
           task_id: taskId,
           namespace: 'SpeechTranscriber',
           name: 'StartTranscriber',
@@ -140,10 +143,10 @@ wss.on('connection', async (clientWs) => {
 
       } else if (eventName === 'TaskFailed') {
         const statusCode = message.header?.status;
-        const msg = message.header?.status_message || 'Unknown error';
+        const msg = message.header?.status_text || message.header?.status_message || 'Unknown error';
         console.error('[Alibaba] Task failed:', statusCode, msg);
         console.error('[Alibaba] Full message:', JSON.stringify(message));
-        safeSend(clientWs, JSON.stringify({ type: 'error', message: `ASR failed (${statusCode}): ${msg}` }));
+        safeSend(clientWs, JSON.stringify({ type: 'error', message: `ASR failed: ${msg}` }));
       }
     });
 
@@ -189,7 +192,7 @@ wss.on('connection', async (clientWs) => {
         try {
           alibabaWs.send(JSON.stringify({
             header: {
-              message_id: crypto.randomUUID(),
+              message_id: newId(),
               task_id: taskId,
               namespace: 'SpeechTranscriber',
               name: 'StopTranscriber',
