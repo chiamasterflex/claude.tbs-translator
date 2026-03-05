@@ -7,48 +7,43 @@ const axios = require('axios');
 const crypto = require('crypto');
 const path = require('path');
 
-// NEW: Alibaba POP Core for CreateToken
-const { RPCClient } = require('@alicloud/pop-core');
-
 const app = express();
 const server = createServer(app);
 
 // ---- Config (ENV ONLY) ----
 const PORT = process.env.PORT || 8080;
 
-// Alibaba NLS
+// Alibaba Speech (NLS)
 const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
 
-// Prefer permanent credentials:
-const ALIBABA_ACCESS_KEY_ID = process.env.ALIBABA_ACCESS_KEY_ID;
-const ALIBABA_ACCESS_KEY_SECRET = process.env.ALIBABA_ACCESS_KEY_SECRET;
+// Option A (old): temp token (24h) - still supported
+let ALIBABA_TOKEN = process.env.ALIBABA_TOKEN;
 
-// Optional fallback (still supported) — but expires:
-const ALIBABA_TOKEN_FALLBACK = process.env.ALIBABA_TOKEN;
+// Option B (recommended): permanent AccessKey pair -> server auto-creates token
+const ALIYUN_AK_ID = process.env.ALIYUN_AK_ID;
+const ALIYUN_AK_SECRET = process.env.ALIYUN_AK_SECRET;
 
 // DeepSeek
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-// Alibaba websocket gateway (Singapore — keep since you said it works)
+// Alibaba WS endpoint (you said this region works for you)
 const ALIBABA_WS_BASE = 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
 
-// Token service endpoint (CreateToken)
-// Alibaba docs show nls-meta.cn-shanghai.aliyuncs.com for CreateToken.  [oai_citation:2‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
-const ALIBABA_TOKEN_ENDPOINT = 'http://nls-meta.cn-shanghai.aliyuncs.com';
-const ALIBABA_TOKEN_API_VERSION = '2019-02-28';
+// Alibaba token OpenAPI endpoint
+const NLS_META_HOST = 'nls-meta.cn-shanghai.aliyuncs.com';
+const NLS_META_BASE = `https://${NLS_META_HOST}/`;
 
+// ---- Helpers ----
 function requireEnv(name, val) {
   if (!val) throw new Error(`[Startup] Missing env var: ${name}`);
 }
-
 requireEnv('ALIBABA_APPKEY', ALIBABA_APPKEY);
 requireEnv('DEEPSEEK_API_KEY', DEEPSEEK_API_KEY);
 
-// We require either permanent AKs OR a fallback token.
-if (!(ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) && !ALIBABA_TOKEN_FALLBACK) {
+// Need either temp token OR AK/SK
+if (!ALIBABA_TOKEN && !(ALIYUN_AK_ID && ALIYUN_AK_SECRET)) {
   throw new Error(
-    '[Startup] Missing Alibaba auth. Provide (ALIBABA_ACCESS_KEY_ID + ALIBABA_ACCESS_KEY_SECRET) ' +
-    'for auto-refresh tokens, OR provide ALIBABA_TOKEN (temporary).'
+    '[Startup] Missing Alibaba auth. Provide either ALIBABA_TOKEN (temporary) OR ALIYUN_AK_ID + ALIYUN_AK_SECRET (recommended).'
   );
 }
 
@@ -60,27 +55,115 @@ function safeJsonSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
-// --- Health endpoint (helps debugging on Railway) ---
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    hasAppKey: !!ALIBABA_APPKEY,
-    hasAccessKeys: !!(ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET),
-    hasFallbackToken: !!ALIBABA_TOKEN_FALLBACK,
-    wsBase: ALIBABA_WS_BASE,
+// ---- Alibaba token manager (auto-refresh) ----
+const tokenState = {
+  id: ALIBABA_TOKEN || null,
+  expireTimeSec: null, // epoch seconds
+  refreshing: null,
+};
+
+function percentEncode(str) {
+  return encodeURIComponent(str)
+    .replace(/\!/g, '%21')
+    .replace(/\'/g, '%27')
+    .replace(/\(/g, '%28')
+    .replace(/\)/g, '%29')
+    .replace(/\*/g, '%2A');
+}
+
+function buildCanonicalizedQuery(params) {
+  const sortedKeys = Object.keys(params).sort();
+  return sortedKeys
+    .map((k) => `${percentEncode(k)}=${percentEncode(params[k])}`)
+    .join('&');
+}
+
+function signAliyun(params, accessKeySecret) {
+  // Aliyun POP signature: HMAC-SHA1 over "GET&%2F&<encodedQuery>"
+  const canonicalized = buildCanonicalizedQuery(params);
+  const stringToSign = `GET&%2F&${percentEncode(canonicalized)}`;
+  const key = `${accessKeySecret}&`;
+  const hmac = crypto.createHmac('sha1', key).update(stringToSign).digest('base64');
+  return hmac;
+}
+
+async function createAlibabaNlsTokenViaOpenAPI() {
+  if (!(ALIYUN_AK_ID && ALIYUN_AK_SECRET)) {
+    throw new Error('ALIYUN_AK_ID/ALIYUN_AK_SECRET not set');
+  }
+
+  const params = {
+    AccessKeyId: ALIYUN_AK_ID,
+    Action: 'CreateToken',
+    Version: '2019-02-28',
+    Format: 'JSON',
+    RegionId: 'cn-shanghai',
+    SignatureMethod: 'HMAC-SHA1',
+    SignatureVersion: '1.0',
+    SignatureNonce: crypto.randomUUID(),
+    Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+  };
+
+  const signature = signAliyun(params, ALIYUN_AK_SECRET);
+  const qs = `Signature=${percentEncode(signature)}&${buildCanonicalizedQuery(params)}`;
+
+  const url = `${NLS_META_BASE}?${qs}`;
+
+  const resp = await axios.get(url, {
+    timeout: 15000,
+    headers: { Host: NLS_META_HOST, Accept: 'application/json' },
   });
-});
 
-// Serve frontend
-app.use(express.static(path.join(__dirname, 'public')));
+  const tokenId = resp.data?.Token?.Id;
+  const expireTime = resp.data?.Token?.ExpireTime;
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] Listening on ${PORT}`);
-});
+  if (!tokenId || !expireTime) {
+    throw new Error(`Unexpected token response: ${JSON.stringify(resp.data).slice(0, 200)}`);
+  }
 
-// WebSocket server on /ws
-const wss = new WebSocketServer({ server, path: '/ws' });
+  return { tokenId, expireTimeSec: Number(expireTime) };
+}
 
+async function ensureAlibabaTokenFresh() {
+  // If using static ALIBABA_TOKEN only (no AK/SK), nothing to refresh
+  if (!ALIYUN_AK_ID || !ALIYUN_AK_SECRET) {
+    if (!tokenState.id) throw new Error('ALIBABA_TOKEN missing');
+    return tokenState.id;
+  }
+
+  // If already have token and it's not close to expiring, reuse it
+  const nowSec = Math.floor(Date.now() / 1000);
+  const refreshWindowSec = 300; // refresh when <5 minutes left
+  if (tokenState.id && tokenState.expireTimeSec && tokenState.expireTimeSec - nowSec > refreshWindowSec) {
+    return tokenState.id;
+  }
+
+  // Prevent parallel refresh stampedes
+  if (tokenState.refreshing) return tokenState.refreshing;
+
+  tokenState.refreshing = (async () => {
+    const { tokenId, expireTimeSec } = await createAlibabaNlsTokenViaOpenAPI();
+    tokenState.id = tokenId;
+    tokenState.expireTimeSec = expireTimeSec;
+
+    console.log(
+      `[AlibabaToken] Refreshed. Expires at epoch=${expireTimeSec} (in ~${expireTimeSec - nowSec}s)`
+    );
+
+    // also update ALIBABA_TOKEN var for any legacy usage
+    ALIBABA_TOKEN = tokenId;
+
+    return tokenId;
+  })();
+
+  try {
+    return await tokenState.refreshing;
+  } finally {
+    tokenState.refreshing = null;
+  }
+}
+
+// ---- DeepSeek translation ----
 async function translateWithDeepSeek(cn) {
   const system = [
     'You are the official translator for True Buddha School (TBS). Translate Chinese to English.',
@@ -114,103 +197,66 @@ async function translateWithDeepSeek(cn) {
   return out;
 }
 
-/**
- * ----------------------------
- * Alibaba Token Auto-Refresh
- * ----------------------------
- * We keep a cached token and refresh when it’s near expiry.
- * CreateToken is called using AccessKeyId/Secret.
- * Endpoint + API version match Alibaba docs.  [oai_citation:3‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
- */
-let cachedAlibabaToken = null;
-let cachedAlibabaTokenExpireAt = 0; // epoch ms
+// Serve frontend
+app.use(express.static(path.join(__dirname, 'public')));
 
-function tokenLooksValid() {
-  // Refresh if token expires within the next 5 minutes.
-  return cachedAlibabaToken && Date.now() < (cachedAlibabaTokenExpireAt - 5 * 60 * 1000);
-}
-
-async function fetchAlibabaTokenWithAccessKeys() {
-  const client = new RPCClient({
-    accessKeyId: ALIBABA_ACCESS_KEY_ID,
-    accessKeySecret: ALIBABA_ACCESS_KEY_SECRET,
-    endpoint: ALIBABA_TOKEN_ENDPOINT,
-    apiVersion: ALIBABA_TOKEN_API_VERSION,
-  });
-
-  // Docs show: client.request('CreateToken') returns { Token, ExpireTime, ... }  [oai_citation:4‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
-  const result = await client.request('CreateToken');
-
-  const token = result?.Token || result?.token;
-  if (!token) {
-    throw new Error(`CreateToken returned no Token. Raw result keys: ${Object.keys(result || {}).join(',')}`);
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[Server] Listening on ${PORT}`);
+  // Warm token on boot (if AK/SK configured)
+  try {
+    await ensureAlibabaTokenFresh();
+  } catch (e) {
+    console.log('[Startup] Token warmup skipped/failed:', e?.message || e);
   }
+});
 
-  // ExpireTime sometimes comes as seconds since epoch, or a string.
-  // If we can’t parse it reliably, assume 23 hours validity.
-  let expireAtMs = 0;
-  const expireTime = result?.ExpireTime || result?.expireTime || result?.ExpireTimeSec;
+// WebSocket server on /ws
+const wss = new WebSocketServer({ server, path: '/ws' });
 
-  if (expireTime) {
-    const n = Number(expireTime);
-    if (Number.isFinite(n) && n > 1e10) {
-      // likely ms epoch
-      expireAtMs = n;
-    } else if (Number.isFinite(n) && n > 1e9) {
-      // likely seconds epoch
-      expireAtMs = n * 1000;
-    } else {
-      // unknown format
-      expireAtMs = Date.now() + 23 * 60 * 60 * 1000;
-    }
-  } else {
-    expireAtMs = Date.now() + 23 * 60 * 60 * 1000;
-  }
-
-  cachedAlibabaToken = token;
-  cachedAlibabaTokenExpireAt = expireAtMs;
-
-  console.log('[AlibabaToken] Refreshed token. Expires at:', new Date(expireAtMs).toISOString());
-  return token;
-}
-
-async function getAlibabaToken() {
-  if (ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) {
-    if (tokenLooksValid()) return cachedAlibabaToken;
-    return await fetchAlibabaTokenWithAccessKeys();
-  }
-
-  // fallback (temporary token supplied by you)
-  if (ALIBABA_TOKEN_FALLBACK) return ALIBABA_TOKEN_FALLBACK;
-
-  throw new Error('No Alibaba token available');
-}
-
-// Optional: background refresh loop when using AKs (keeps system warm)
-if (ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) {
-  // refresh every 2 hours if needed
-  setInterval(() => {
-    getAlibabaToken().catch((e) => console.error('[AlibabaToken] Refresh loop error:', e?.message || e));
-  }, 2 * 60 * 60 * 1000);
-}
-
-wss.on('connection', (clientWs, req) => {
+wss.on('connection', (clientWs) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
   let alibabaReady = false;
 
+  const taskId = newId();
+
   // Buffer audio until Alibaba is ready
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds PCM16 mono 16k
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 sec PCM16 mono 16k
 
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
 
-  const taskId = newId();
+  // Simple reconnect backoff
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect(reason) {
+    if (clientWs.readyState !== WebSocket.OPEN) return;
+    if (reconnectTimer) return;
+
+    reconnectAttempts += 1;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000); // 1s,2s,4s...max 15s
+    console.log(`[Alibaba] Reconnect scheduled in ${delay}ms. Reason: ${reason}`);
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectAlibabaIfNeeded(true);
+    }, delay);
+  }
 
   function closeAlibaba() {
+    clearReconnectTimer();
+
     if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
       try {
         const stop = {
@@ -226,20 +272,29 @@ wss.on('connection', (clientWs, req) => {
         alibabaWs.send(JSON.stringify(stop));
       } catch (_) {}
     }
-    try { alibabaWs?.close(); } catch (_) {}
+
+    try {
+      alibabaWs?.close();
+    } catch (_) {}
+
     alibabaWs = null;
     alibabaReady = false;
   }
 
-  async function connectAlibabaIfNeeded() {
-    if (alibabaWs) return;
+  async function connectAlibabaIfNeeded(force = false) {
+    if (alibabaWs && !force) return;
 
+    // reset if forcing
+    if (force) closeAlibaba();
+
+    // Ensure token is fresh (auto-refresh if AK/SK)
     let token;
     try {
-      token = await getAlibabaToken();
+      token = await ensureAlibabaTokenFresh();
     } catch (e) {
-      console.error('[AlibabaToken] Unable to get token:', e?.message || e);
-      safeJsonSend(clientWs, { type: 'error', message: 'Alibaba token missing/invalid' });
+      console.error('[AlibabaToken] ensureAlibabaTokenFresh failed:', e?.message || e);
+      safeJsonSend(clientWs, { type: 'error', message: 'Alibaba token unavailable' });
+      scheduleReconnect('token_unavailable');
       return;
     }
 
@@ -250,6 +305,7 @@ wss.on('connection', (clientWs, req) => {
 
     alibabaWs.on('open', () => {
       console.log('[Alibaba] WS open');
+      reconnectAttempts = 0; // reset backoff on success
 
       const start = {
         header: {
@@ -285,16 +341,12 @@ wss.on('connection', (clientWs, req) => {
       if (eventName === 'TranscriptionStarted') {
         alibabaReady = true;
         console.log('[Alibaba] Ready. Flushing buffered audio:', bufferedBytes, 'bytes');
-
         safeJsonSend(clientWs, { type: 'status', status: 'ready' });
 
-        // Flush buffered audio immediately
         while (audioBufferQueue.length) {
           const chunk = audioBufferQueue.shift();
           bufferedBytes -= chunk.length;
-          if (alibabaWs.readyState === WebSocket.OPEN) {
-            alibabaWs.send(chunk);
-          }
+          if (alibabaWs.readyState === WebSocket.OPEN) alibabaWs.send(chunk);
         }
       }
 
@@ -320,20 +372,15 @@ wss.on('connection', (clientWs, req) => {
         const statusMsg = msg?.header?.status_message || 'unknown';
         console.error('[Alibaba] TaskFailed:', statusMsg);
 
-        safeJsonSend(clientWs, {
-          type: 'error',
-          message: `Alibaba task failed: ${statusMsg}`,
-        });
+        safeJsonSend(clientWs, { type: 'error', message: `Alibaba task failed: ${statusMsg}` });
 
-        // If token expired/invalid, force refresh and reconnect on next audio
-        // (common message contains something like "token invalid" / "authentication failed")
-        if (/token|auth|expired|invalid/i.test(statusMsg)) {
-          cachedAlibabaToken = null;
-          cachedAlibabaTokenExpireAt = 0;
-          console.log('[AlibabaToken] Token probably expired; cache cleared.');
-        }
-
+        // Very often this is token expiry/invalid. Refresh & reconnect.
+        // If using AK/SK, ensureAlibabaTokenFresh() will fetch a new one.
         closeAlibaba();
+        try {
+          await ensureAlibabaTokenFresh();
+        } catch (_) {}
+        scheduleReconnect(`task_failed:${statusMsg}`);
       }
     });
 
@@ -341,17 +388,19 @@ wss.on('connection', (clientWs, req) => {
       console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
       alibabaReady = false;
       alibabaWs = null;
+      scheduleReconnect(`ws_close:${code}`);
     });
 
     alibabaWs.on('error', (err) => {
       console.error('[Alibaba] WS error:', err?.message || err);
       safeJsonSend(clientWs, { type: 'error', message: 'Alibaba WS error' });
+      // usually followed by close; but just in case:
+      scheduleReconnect('ws_error');
     });
   }
 
   // Client messages: binary audio or JSON commands
   clientWs.on('message', async (data, isBinary) => {
-    // Binary audio
     if (isBinary) {
       const buf = Buffer.from(data);
       lastAudioAt = Date.now();
@@ -362,9 +411,10 @@ wss.on('connection', (clientWs, req) => {
       }
 
       // Start Alibaba only when first audio arrives
-      await connectAlibabaIfNeeded();
+      connectAlibabaIfNeeded().catch((e) => {
+        console.error('[Alibaba] connect failed:', e?.message || e);
+      });
 
-      // If Alibaba not ready yet, buffer (up to ~2 sec)
       if (!alibabaReady) {
         if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
           audioBufferQueue.push(buf);
@@ -373,14 +423,12 @@ wss.on('connection', (clientWs, req) => {
         return;
       }
 
-      // Alibaba ready: forward immediately
       if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
         alibabaWs.send(buf);
       }
       return;
     }
 
-    // Text message: JSON command
     let msg;
     try {
       msg = JSON.parse(data.toString());
