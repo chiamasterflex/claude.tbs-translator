@@ -7,31 +7,35 @@ const axios = require('axios');
 const crypto = require('crypto');
 const path = require('path');
 
+// NEW: Alibaba POP Core for CreateToken
+const { RPCClient } = require('@alicloud/pop-core');
+
 const app = express();
 const server = createServer(app);
 
 // ---- Config (ENV ONLY) ----
 const PORT = process.env.PORT || 8080;
 
+// Alibaba NLS
 const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
 
-// Optional: if you still want to manually paste a temporary token for testing
+// Prefer permanent credentials:
+const ALIBABA_ACCESS_KEY_ID = process.env.ALIBABA_ACCESS_KEY_ID;
+const ALIBABA_ACCESS_KEY_SECRET = process.env.ALIBABA_ACCESS_KEY_SECRET;
+
+// Optional fallback (still supported) — but expires:
 const ALIBABA_TOKEN_FALLBACK = process.env.ALIBABA_TOKEN;
 
-// Permanent credentials (recommended)
-const ALIBABA_AK_ID = process.env.ALIBABA_AK_ID;
-const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET;
-
+// DeepSeek
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-// Alibaba region + endpoints
-const ALIBABA_REGION_ID = process.env.ALIBABA_REGION_ID || 'ap-southeast-1';
-const ALIBABA_WS_BASE =
-  process.env.ALIBABA_WS_BASE || 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
+// Alibaba websocket gateway (Singapore — keep since you said it works)
+const ALIBABA_WS_BASE = 'wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1';
 
-// Token API endpoint per Alibaba docs (CreateToken POP API)
-const ALIBABA_TOKEN_ENDPOINT =
-  process.env.ALIBABA_TOKEN_ENDPOINT || `https://nlsmeta.${ALIBABA_REGION_ID}.aliyuncs.com/`;
+// Token service endpoint (CreateToken)
+// Alibaba docs show nls-meta.cn-shanghai.aliyuncs.com for CreateToken.  [oai_citation:2‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
+const ALIBABA_TOKEN_ENDPOINT = 'http://nls-meta.cn-shanghai.aliyuncs.com';
+const ALIBABA_TOKEN_API_VERSION = '2019-02-28';
 
 function requireEnv(name, val) {
   if (!val) throw new Error(`[Startup] Missing env var: ${name}`);
@@ -40,15 +44,15 @@ function requireEnv(name, val) {
 requireEnv('ALIBABA_APPKEY', ALIBABA_APPKEY);
 requireEnv('DEEPSEEK_API_KEY', DEEPSEEK_API_KEY);
 
-// We require either (AK_ID + AK_SECRET) OR a fallback token
-if (!(ALIBABA_AK_ID && ALIBABA_AK_SECRET) && !ALIBABA_TOKEN_FALLBACK) {
+// We require either permanent AKs OR a fallback token.
+if (!(ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) && !ALIBABA_TOKEN_FALLBACK) {
   throw new Error(
-    '[Startup] Missing Alibaba auth. Provide ALIBABA_AK_ID + ALIBABA_AK_SECRET (recommended) OR ALIBABA_TOKEN (temporary).'
+    '[Startup] Missing Alibaba auth. Provide (ALIBABA_ACCESS_KEY_ID + ALIBABA_ACCESS_KEY_SECRET) ' +
+    'for auto-refresh tokens, OR provide ALIBABA_TOKEN (temporary).'
   );
 }
 
 function newId() {
-  // Node 18+ has randomUUID
   return crypto.randomUUID().replace(/-/g, '');
 }
 
@@ -56,9 +60,27 @@ function safeJsonSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
-// ---------------------------
-// DeepSeek Translation
-// ---------------------------
+// --- Health endpoint (helps debugging on Railway) ---
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    hasAppKey: !!ALIBABA_APPKEY,
+    hasAccessKeys: !!(ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET),
+    hasFallbackToken: !!ALIBABA_TOKEN_FALLBACK,
+    wsBase: ALIBABA_WS_BASE,
+  });
+});
+
+// Serve frontend
+app.use(express.static(path.join(__dirname, 'public')));
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] Listening on ${PORT}`);
+});
+
+// WebSocket server on /ws
+const wss = new WebSocketServer({ server, path: '/ws' });
+
 async function translateWithDeepSeek(cn) {
   const system = [
     'You are the official translator for True Buddha School (TBS). Translate Chinese to English.',
@@ -92,174 +114,87 @@ async function translateWithDeepSeek(cn) {
   return out;
 }
 
-// ---------------------------
-// Alibaba Token: Auto-fetch + refresh (permanent)
-// ---------------------------
+/**
+ * ----------------------------
+ * Alibaba Token Auto-Refresh
+ * ----------------------------
+ * We keep a cached token and refresh when it’s near expiry.
+ * CreateToken is called using AccessKeyId/Secret.
+ * Endpoint + API version match Alibaba docs.  [oai_citation:3‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
+ */
+let cachedAlibabaToken = null;
+let cachedAlibabaTokenExpireAt = 0; // epoch ms
 
-let currentAlibabaToken = ALIBABA_TOKEN_FALLBACK || null;
-let currentAlibabaTokenExpireMs = 0;
-let tokenRefreshTimer = null;
-
-function percentEncode(str) {
-  // POP encoding rules: encodeURIComponent + special replacements
-  return encodeURIComponent(str)
-    .replace(/\+/g, '%20')
-    .replace(/\*/g, '%2A')
-    .replace(/%7E/g, '~');
+function tokenLooksValid() {
+  // Refresh if token expires within the next 5 minutes.
+  return cachedAlibabaToken && Date.now() < (cachedAlibabaTokenExpireAt - 5 * 60 * 1000);
 }
 
-function popSign(method, pathStr, params, accessKeySecret) {
-  // 1) sort params by key
-  const keys = Object.keys(params).sort();
-  // 2) canonicalized query string
-  const canonicalized = keys
-    .map((k) => `${percentEncode(k)}=${percentEncode(params[k])}`)
-    .join('&');
+async function fetchAlibabaTokenWithAccessKeys() {
+  const client = new RPCClient({
+    accessKeyId: ALIBABA_ACCESS_KEY_ID,
+    accessKeySecret: ALIBABA_ACCESS_KEY_SECRET,
+    endpoint: ALIBABA_TOKEN_ENDPOINT,
+    apiVersion: ALIBABA_TOKEN_API_VERSION,
+  });
 
-  // 3) stringToSign
-  const stringToSign = `${method}&${percentEncode(pathStr)}&${percentEncode(canonicalized)}`;
+  // Docs show: client.request('CreateToken') returns { Token, ExpireTime, ... }  [oai_citation:4‡static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com](https://static-aliyun-doc.oss-cn-hangzhou.aliyuncs.com/download%2Fpdf%2F70465%2F%25E5%25BC%2580%25E5%258F%2591%25E6%258C%2587%25E5%258D%2597_cn_zh-CN.pdf)
+  const result = await client.request('CreateToken');
 
-  // 4) HMAC-SHA1 with key = AccessKeySecret + '&'
-  const hmac = crypto.createHmac('sha1', `${accessKeySecret}&`);
-  hmac.update(stringToSign);
-  return hmac.digest('base64');
-}
-
-async function fetchAlibabaToken() {
-  if (!(ALIBABA_AK_ID && ALIBABA_AK_SECRET)) {
-    if (ALIBABA_TOKEN_FALLBACK) {
-      console.log('[AlibabaToken] Using fallback ALIBABA_TOKEN (temporary).');
-      currentAlibabaToken = ALIBABA_TOKEN_FALLBACK;
-      currentAlibabaTokenExpireMs = Date.now() + 60 * 60 * 1000; // unknown, just 1h placeholder
-      return { token: currentAlibabaToken, expireMs: currentAlibabaTokenExpireMs };
-    }
-    throw new Error('No Alibaba AK creds and no fallback token.');
+  const token = result?.Token || result?.token;
+  if (!token) {
+    throw new Error(`CreateToken returned no Token. Raw result keys: ${Object.keys(result || {}).join(',')}`);
   }
 
-  const method = 'GET';
-  const pathStr = '/';
+  // ExpireTime sometimes comes as seconds since epoch, or a string.
+  // If we can’t parse it reliably, assume 23 hours validity.
+  let expireAtMs = 0;
+  const expireTime = result?.ExpireTime || result?.expireTime || result?.ExpireTimeSec;
 
-  const params = {
-    AccessKeyId: ALIBABA_AK_ID,
-    Action: 'CreateToken',
-    Version: '2019-02-28',
-    Format: 'JSON',
-    RegionId: ALIBABA_REGION_ID,
-    SignatureMethod: 'HMAC-SHA1',
-    SignatureVersion: '1.0',
-    SignatureNonce: crypto.randomUUID(), // must be unique
-    Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-  };
-
-  const signature = popSign(method, pathStr, params, ALIBABA_AK_SECRET);
-
-  const fullParams = { ...params, Signature: signature };
-
-  const url =
-    ALIBABA_TOKEN_ENDPOINT +
-    '?' +
-    Object.keys(fullParams)
-      .sort()
-      .map((k) => `${percentEncode(k)}=${percentEncode(fullParams[k])}`)
-      .join('&');
-
-  console.log('[AlibabaToken] Fetching new token from', ALIBABA_TOKEN_ENDPOINT);
-
-  const resp = await axios.get(url, { timeout: 15000 });
-  const tokenId = resp.data?.Token?.Id;
-  const expireTimeSec = resp.data?.Token?.ExpireTime;
-
-  if (!tokenId || !expireTimeSec) {
-    console.error('[AlibabaToken] Bad response:', resp.data);
-    throw new Error('Alibaba token response missing Token.Id / Token.ExpireTime');
-  }
-
-  currentAlibabaToken = tokenId;
-  currentAlibabaTokenExpireMs = expireTimeSec * 1000;
-
-  const minsLeft = Math.round((currentAlibabaTokenExpireMs - Date.now()) / 60000);
-  console.log(`[AlibabaToken] Token OK. Minutes left: ~${minsLeft}`);
-
-  return { token: currentAlibabaToken, expireMs: currentAlibabaTokenExpireMs };
-}
-
-function scheduleAlibabaTokenRefresh() {
-  if (!(ALIBABA_AK_ID && ALIBABA_AK_SECRET)) {
-    console.log('[AlibabaToken] No AK creds; skipping auto-refresh schedule.');
-    return;
-  }
-
-  if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer);
-
-  // refresh 5 minutes before expiry (or in 1 minute if expiry is soon)
-  const refreshAtMs = Math.max(currentAlibabaTokenExpireMs - 5 * 60 * 1000, Date.now() + 60 * 1000);
-  const delay = Math.max(refreshAtMs - Date.now(), 10 * 1000);
-
-  tokenRefreshTimer = setTimeout(async () => {
-    try {
-      await fetchAlibabaToken();
-      scheduleAlibabaTokenRefresh();
-    } catch (e) {
-      console.error('[AlibabaToken] Refresh failed:', e?.message || e);
-      // retry in 30s
-      tokenRefreshTimer = setTimeout(async () => {
-        try {
-          await fetchAlibabaToken();
-          scheduleAlibabaTokenRefresh();
-        } catch (err2) {
-          console.error('[AlibabaToken] Retry refresh failed:', err2?.message || err2);
-        }
-      }, 30000);
-    }
-  }, delay);
-
-  console.log('[AlibabaToken] Next refresh scheduled in', Math.round(delay / 1000), 'sec');
-}
-
-async function ensureAlibabaTokenFresh() {
-  // If using fallback token, just use it (may expire)
-  if (!(ALIBABA_AK_ID && ALIBABA_AK_SECRET)) return currentAlibabaToken;
-
-  const now = Date.now();
-  const needs =
-    !currentAlibabaToken ||
-    !currentAlibabaTokenExpireMs ||
-    now > currentAlibabaTokenExpireMs - 2 * 60 * 1000; // if <2 mins left, refresh
-
-  if (needs) {
-    await fetchAlibabaToken();
-    scheduleAlibabaTokenRefresh();
-  }
-  return currentAlibabaToken;
-}
-
-// ---------------------------
-// Server startup
-// ---------------------------
-
-// Serve frontend
-app.use(express.static(path.join(__dirname, 'public')));
-
-server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`[Server] Listening on ${PORT}`);
-
-  // Prime token on boot if AK creds provided
-  try {
-    if (ALIBABA_AK_ID && ALIBABA_AK_SECRET) {
-      await fetchAlibabaToken();
-      scheduleAlibabaTokenRefresh();
+  if (expireTime) {
+    const n = Number(expireTime);
+    if (Number.isFinite(n) && n > 1e10) {
+      // likely ms epoch
+      expireAtMs = n;
+    } else if (Number.isFinite(n) && n > 1e9) {
+      // likely seconds epoch
+      expireAtMs = n * 1000;
     } else {
-      console.log('[AlibabaToken] Running with ALIBABA_TOKEN fallback only (temporary).');
+      // unknown format
+      expireAtMs = Date.now() + 23 * 60 * 60 * 1000;
     }
-  } catch (e) {
-    console.error('[AlibabaToken] Initial token fetch failed:', e?.message || e);
+  } else {
+    expireAtMs = Date.now() + 23 * 60 * 60 * 1000;
   }
-});
 
-// WebSocket server on /ws
-const wss = new WebSocketServer({ server, path: '/ws' });
+  cachedAlibabaToken = token;
+  cachedAlibabaTokenExpireAt = expireAtMs;
 
-wss.on('connection', (clientWs) => {
+  console.log('[AlibabaToken] Refreshed token. Expires at:', new Date(expireAtMs).toISOString());
+  return token;
+}
+
+async function getAlibabaToken() {
+  if (ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) {
+    if (tokenLooksValid()) return cachedAlibabaToken;
+    return await fetchAlibabaTokenWithAccessKeys();
+  }
+
+  // fallback (temporary token supplied by you)
+  if (ALIBABA_TOKEN_FALLBACK) return ALIBABA_TOKEN_FALLBACK;
+
+  throw new Error('No Alibaba token available');
+}
+
+// Optional: background refresh loop when using AKs (keeps system warm)
+if (ALIBABA_ACCESS_KEY_ID && ALIBABA_ACCESS_KEY_SECRET) {
+  // refresh every 2 hours if needed
+  setInterval(() => {
+    getAlibabaToken().catch((e) => console.error('[AlibabaToken] Refresh loop error:', e?.message || e));
+  }, 2 * 60 * 60 * 1000);
+}
+
+wss.on('connection', (clientWs, req) => {
   console.log('[WS] Client connected');
 
   let alibabaWs = null;
@@ -268,7 +203,7 @@ wss.on('connection', (clientWs) => {
   // Buffer audio until Alibaba is ready
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds of PCM16 mono 16k
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds PCM16 mono 16k
 
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
@@ -291,9 +226,7 @@ wss.on('connection', (clientWs) => {
         alibabaWs.send(JSON.stringify(stop));
       } catch (_) {}
     }
-    try {
-      alibabaWs?.close();
-    } catch (_) {}
+    try { alibabaWs?.close(); } catch (_) {}
     alibabaWs = null;
     alibabaReady = false;
   }
@@ -303,10 +236,10 @@ wss.on('connection', (clientWs) => {
 
     let token;
     try {
-      token = await ensureAlibabaTokenFresh();
+      token = await getAlibabaToken();
     } catch (e) {
-      console.error('[AlibabaToken] Could not ensure token:', e?.message || e);
-      safeJsonSend(clientWs, { type: 'error', message: 'Alibaba token fetch failed' });
+      console.error('[AlibabaToken] Unable to get token:', e?.message || e);
+      safeJsonSend(clientWs, { type: 'error', message: 'Alibaba token missing/invalid' });
       return;
     }
 
@@ -336,7 +269,6 @@ wss.on('connection', (clientWs) => {
       };
 
       alibabaWs.send(JSON.stringify(start));
-      safeJsonSend(clientWs, { type: 'status', status: 'connecting_asr' });
     });
 
     alibabaWs.on('message', async (data) => {
@@ -385,11 +317,22 @@ wss.on('connection', (clientWs) => {
       }
 
       if (eventName === 'TaskFailed') {
-        console.error('[Alibaba] TaskFailed:', msg?.header?.status_message || msg?.header);
+        const statusMsg = msg?.header?.status_message || 'unknown';
+        console.error('[Alibaba] TaskFailed:', statusMsg);
+
         safeJsonSend(clientWs, {
           type: 'error',
-          message: `Alibaba task failed: ${msg?.header?.status_message || 'unknown'}`,
+          message: `Alibaba task failed: ${statusMsg}`,
         });
+
+        // If token expired/invalid, force refresh and reconnect on next audio
+        // (common message contains something like "token invalid" / "authentication failed")
+        if (/token|auth|expired|invalid/i.test(statusMsg)) {
+          cachedAlibabaToken = null;
+          cachedAlibabaTokenExpireAt = 0;
+          console.log('[AlibabaToken] Token probably expired; cache cleared.');
+        }
+
         closeAlibaba();
       }
     });
