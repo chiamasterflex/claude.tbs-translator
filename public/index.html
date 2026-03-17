@@ -5,279 +5,185 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>TBS Live Translator</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
+    body { font-family: system-ui; margin: 20px; }
     .row { display: flex; gap: 16px; }
     .col { flex: 1; }
     textarea { width: 100%; height: 260px; }
     button { padding: 10px 14px; margin-right: 8px; }
-    .status { margin: 10px 0; opacity: 0.9; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eee; }
-    code { background: #f4f4f4; padding: 1px 4px; border-radius: 4px; }
   </style>
 </head>
 <body>
-  <h1>TBS Live Translator</h1>
 
-  <div>
-    <button id="btnStart">Start</button>
-    <button id="btnStop" disabled>Stop</button>
-    <span class="status">Status: <span id="status" class="pill">idle</span></span>
+<h2>TBS Live Translator</h2>
+
+<button id="start">Start</button>
+<button id="stop" disabled>Stop</button>
+
+<p>Status: <span id="status">idle</span></p>
+
+<div class="row">
+  <div class="col">
+    <h3>Chinese</h3>
+    <textarea id="cn"></textarea>
   </div>
-
-  <div class="row">
-    <div class="col">
-      <h3>Live Chinese</h3>
-      <textarea id="cn" readonly></textarea>
-    </div>
-    <div class="col">
-      <h3>English</h3>
-      <textarea id="en" readonly></textarea>
-    </div>
+  <div class="col">
+    <h3>English</h3>
+    <textarea id="en"></textarea>
   </div>
+</div>
 
-  <script>
-    const statusEl = document.getElementById('status');
-    const cnEl = document.getElementById('cn');
-    const enEl = document.getElementById('en');
-    const btnStart = document.getElementById('btnStart');
-    const btnStop = document.getElementById('btnStop');
+<script>
+let ws;
+let audioCtx;
+let processor;
+let source;
+let stream;
 
-    let ws = null;
-    let audioCtx = null;
-    let micStream = null;
-    let sourceNode = null;
-    let processorNode = null;
-    let streamActive = false;
+const statusEl = document.getElementById('status');
+const cnEl = document.getElementById('cn');
+const enEl = document.getElementById('en');
 
-    function setStatus(s) {
-      statusEl.textContent = s;
-      console.log('[UI]', s);
+function setStatus(s) {
+  statusEl.textContent = s;
+  console.log('[STATUS]', s);
+}
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host + '/ws';
+}
+
+function append(el, text) {
+  el.value += text + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function downsample(buffer, inRate, outRate) {
+  if (inRate === outRate) return buffer;
+
+  const ratio = inRate / outRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+
+  let offset = 0;
+
+  for (let i = 0; i < newLen; i++) {
+    const next = Math.round((i + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+
+    for (let j = offset; j < next && j < buffer.length; j++) {
+      sum += buffer[j];
+      count++;
     }
 
-    function wsUrl() {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${proto}//${location.host}/ws`;
+    result[i] = sum / count;
+    offset = next;
+  }
+
+  return result;
+}
+
+function toPCM(float32) {
+  const buf = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buf);
+
+  let i = 0;
+  for (let j = 0; j < float32.length; j++, i += 2) {
+    let s = Math.max(-1, Math.min(1, float32[j]));
+    view.setInt16(i, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+
+  return buf;
+}
+
+document.getElementById('start').onclick = async () => {
+  setStatus('connecting');
+
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    console.log('[WS] open');
+    setStatus('mic');
+
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    audioCtx = new AudioContext();
+    source = audioCtx.createMediaStreamSource(stream);
+
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const input = e.inputBuffer.getChannelData(0);
+      const down = downsample(input, audioCtx.sampleRate, 16000);
+      const pcm = toPCM(down);
+
+      if (pcm.byteLength < 1000) return;
+
+      ws.send(pcm);
+      console.log('[SEND]', pcm.byteLength);
+    };
+
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    setStatus('streaming');
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'live_cn') {
+      cnEl.value = msg.text;
     }
 
-    function appendLine(el, text) {
-      el.value = (el.value + (el.value ? '\n' : '') + text).slice(-20000);
-      el.scrollTop = el.scrollHeight;
+    if (msg.type === 'final') {
+      append(cnEl, msg.cn);
+      append(enEl, msg.en);
     }
 
-    function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
-      if (outputSampleRate === inputSampleRate) return buffer;
-      if (outputSampleRate > inputSampleRate) {
-        throw new Error('Output sample rate must be <= input sample rate');
-      }
-
-      const sampleRateRatio = inputSampleRate / outputSampleRate;
-      const newLength = Math.round(buffer.length / sampleRateRatio);
-      const result = new Float32Array(newLength);
-
-      let offsetResult = 0;
-      let offsetBuffer = 0;
-
-      while (offsetResult < result.length) {
-        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-        let accum = 0;
-        let count = 0;
-
-        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-          accum += buffer[i];
-          count++;
-        }
-
-        result[offsetResult] = count > 0 ? accum / count : 0;
-        offsetResult++;
-        offsetBuffer = nextOffsetBuffer;
-      }
-
-      return result;
+    if (msg.type === 'status') {
+      setStatus(msg.status);
     }
+  };
 
-    function floatTo16BitPCM(float32Array) {
-      const buffer = new ArrayBuffer(float32Array.length * 2);
-      const view = new DataView(buffer);
+  ws.onclose = () => {
+    console.log('[WS] closed');
+    setStatus('closed');
+  };
 
-      let offset = 0;
-      for (let i = 0; i < float32Array.length; i++, offset += 2) {
-        let s = Math.max(-1, Math.min(1, float32Array[i]));
-        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-      }
+  ws.onerror = (err) => {
+    console.error(err);
+    setStatus('error');
+  };
 
-      return buffer;
-    }
+  document.getElementById('start').disabled = true;
+  document.getElementById('stop').disabled = false;
+};
 
-    async function start() {
-      if (streamActive) return;
+document.getElementById('stop').onclick = async () => {
+  setStatus('stopping');
 
-      btnStart.disabled = true;
-      btnStop.disabled = false;
-      cnEl.value = '';
-      enEl.value = '';
-      setStatus('connecting');
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
 
-      ws = new WebSocket(wsUrl());
-      ws.binaryType = 'arraybuffer';
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+  }
 
-      ws.onopen = async () => {
-        console.log('[WS] open');
-        setStatus('ws_open');
-        try {
-          await startAudio();
-        } catch (err) {
-          console.error('[Audio] start failed', err);
-          setStatus('audio_error');
-          await stop();
-        }
-      };
+  if (audioCtx) await audioCtx.close();
 
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          console.log('[WS] message', msg);
+  if (ws) ws.close();
 
-          if (msg.type === 'status') {
-            setStatus(msg.status);
-          }
+  setStatus('idle');
 
-          if (msg.type === 'live_cn') {
-            cnEl.value = msg.text;
-          }
+  document.getElementById('start').disabled = false;
+  document.getElementById('stop').disabled = true;
+};
+</script>
 
-          if (msg.type === 'final') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'manual_result') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'error') {
-            console.error('[Server error]', msg.message);
-            setStatus('error');
-          }
-        } catch (err) {
-          console.error('[WS] bad message', err);
-        }
-      };
-
-      ws.onclose = () => {
-        console.log('[WS] closed');
-        setStatus('ws_closed');
-      };
-
-      ws.onerror = (err) => {
-        console.error('[WS] error', err);
-        setStatus('ws_error');
-      };
-    }
-
-    async function stop() {
-      streamActive = false;
-      btnStart.disabled = false;
-      btnStop.disabled = true;
-
-      try {
-        if (processorNode) processorNode.disconnect();
-      } catch (_) {}
-
-      try {
-        if (sourceNode) sourceNode.disconnect();
-      } catch (_) {}
-
-      try {
-        if (micStream) {
-          micStream.getTracks().forEach(track => track.stop());
-        }
-      } catch (_) {}
-
-      try {
-        if (audioCtx && audioCtx.state !== 'closed') {
-          await audioCtx.close();
-        }
-      } catch (_) {}
-
-      try {
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-          ws.close();
-        }
-      } catch (_) {}
-
-      processorNode = null;
-      sourceNode = null;
-      micStream = null;
-      audioCtx = null;
-      ws = null;
-
-      setStatus('idle');
-    }
-
-    btnStart.onclick = start;
-    btnStop.onclick = stop;
-
-    async function startAudio() {
-      setStatus('mic_permission');
-
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false
-        }
-      });
-
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
-
-      console.log('[Audio] sampleRate', audioCtx.sampleRate);
-      setStatus(`audio_${audioCtx.sampleRate}hz`);
-
-      sourceNode = audioCtx.createMediaStreamSource(micStream);
-
-      // ScriptProcessor is deprecated but far more predictable here than the current worklet setup.
-      const bufferSize = 4096;
-      processorNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-
-      processorNode.onaudioprocess = (event) => {
-        if (!streamActive && ws && ws.readyState === WebSocket.OPEN) {
-          streamActive = true;
-        }
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        const inputData = event.inputBuffer.getChannelData(0);
-        const downsampled = downsampleBuffer(inputData, audioCtx.sampleRate, 16000);
-        const pcmBuffer = floatTo16BitPCM(downsampled);
-
-        // Ignore absurdly tiny frames
-        if (pcmBuffer.byteLength < 640) return;
-
-        try {
-          ws.send(pcmBuffer);
-          console.log('[Audio] sent bytes', pcmBuffer.byteLength);
-        } catch (err) {
-          console.error('[Audio] send failed', err);
-        }
-      };
-
-      sourceNode.connect(processorNode);
-      processorNode.connect(audioCtx.destination);
-
-      streamActive = true;
-      setStatus('streaming_pcm16_16k');
-      console.log('[Audio] pipeline active');
-    }
-
-    window.addEventListener('beforeunload', () => {
-      stop();
-    });
-  </script>
 </body>
 </html>
