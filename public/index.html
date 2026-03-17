@@ -5,29 +5,45 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>TBS Live Translator</title>
   <style>
+    :root {
+      --bg: #f7f7f8;
+      --panel: #ffffff;
+      --border: #d9d9de;
+      --text: #111827;
+      --muted: #6b7280;
+    }
+
+    * { box-sizing: border-box; }
+
     body {
+      margin: 0;
+      padding: 24px;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 20px;
-      color: #111;
+      color: var(--text);
+      background: var(--bg);
     }
 
     h1 {
-      margin-bottom: 16px;
+      margin: 0 0 20px;
+      font-size: 40px;
+      line-height: 1.1;
     }
 
     .toolbar {
       display: flex;
       align-items: center;
       gap: 12px;
-      margin-bottom: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
     }
 
     button {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
       padding: 10px 16px;
-      font-size: 14px;
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      background: #fff;
+      border-radius: 10px;
+      font-size: 16px;
       cursor: pointer;
     }
 
@@ -37,43 +53,64 @@
     }
 
     .status {
-      font-size: 14px;
+      font-size: 16px;
+      color: var(--muted);
+    }
+
+    .status strong {
+      color: var(--text);
+      font-weight: 600;
     }
 
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-top: 12px;
+      gap: 20px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
     }
 
     .panel h3 {
-      margin: 0 0 8px 0;
+      margin: 0 0 12px;
       font-size: 20px;
     }
 
     textarea {
       width: 100%;
-      height: 360px;
-      box-sizing: border-box;
+      height: 420px;
       resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 10px;
       padding: 12px;
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      font-size: 14px;
-      line-height: 1.4;
+      font-size: 16px;
+      line-height: 1.45;
+      background: #fff;
+      color: var(--text);
     }
 
     .meta {
       margin-top: 14px;
-      font-size: 12px;
-      color: #666;
+      font-size: 13px;
+      color: var(--muted);
       white-space: pre-wrap;
     }
 
     @media (max-width: 900px) {
       .grid {
         grid-template-columns: 1fr;
+      }
+
+      h1 {
+        font-size: 32px;
+      }
+
+      textarea {
+        height: 280px;
       }
     }
   </style>
@@ -84,7 +121,7 @@
   <div class="toolbar">
     <button id="btnStart">Start</button>
     <button id="btnStop" disabled>Stop</button>
-    <div class="status">Status: <span id="status">idle</span></div>
+    <div class="status">Status: <strong id="status">idle</strong></div>
   </div>
 
   <div class="grid">
@@ -92,6 +129,7 @@
       <h3>Live Chinese</h3>
       <textarea id="cn" readonly></textarea>
     </div>
+
     <div class="panel">
       <h3>English</h3>
       <textarea id="en" readonly></textarea>
@@ -109,17 +147,15 @@
     const metaEl = document.getElementById('meta');
 
     let ws = null;
-    let audioCtx = null;
-    let micStream = null;
+    let audioContext = null;
+    let mediaStream = null;
     let sourceNode = null;
     let workletNode = null;
     let zeroGainNode = null;
-    let pingTimer = null;
-
-    let running = false;
-    let frameCount = 0;
-    let lastSentBytes = 0;
-    let currentLiveCn = '';
+    let keepAliveTimer = null;
+    let isRunning = false;
+    let sentFrameCount = 0;
+    let lastBytes = 0;
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -128,13 +164,13 @@
 
     function updateMeta() {
       metaEl.textContent =
-        `frames sent: ${frameCount}\n` +
-        `last bytes: ${lastSentBytes}\n` +
-        `ws readyState: ${ws ? ws.readyState : 'none'}\n` +
-        `audio state: ${audioCtx ? audioCtx.state : 'none'}`;
+        `frames sent: ${sentFrameCount}\n` +
+        `last bytes: ${lastBytes}\n` +
+        `ws state: ${ws ? ws.readyState : 'none'}\n` +
+        `audio state: ${audioContext ? audioContext.state : 'none'}`;
     }
 
-    function getWsUrl() {
+    function wsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${proto}//${location.host}/ws`;
     }
@@ -145,19 +181,12 @@
       el.scrollTop = el.scrollHeight;
     }
 
-    function stopPing() {
-      if (pingTimer) {
-        clearInterval(pingTimer);
-        pingTimer = null;
-      }
-    }
-
-    function startPing() {
-      stopPing();
-      pingTimer = setInterval(() => {
+    function startKeepAlive() {
+      stopKeepAlive();
+      keepAliveTimer = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           try {
-            ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+            ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
           } catch (err) {
             console.error('[WS] ping failed', err);
           }
@@ -165,77 +194,17 @@
       }, 5000);
     }
 
-    async function openWebSocket() {
-      return new Promise((resolve, reject) => {
-        ws = new WebSocket(getWsUrl());
-        ws.binaryType = 'arraybuffer';
-
-        const timeout = setTimeout(() => {
-          reject(new Error('WebSocket open timeout'));
-        }, 10000);
-
-        ws.onopen = () => {
-          clearTimeout(timeout);
-          console.log('[WS] open');
-          setStatus('ws_open');
-          startPing();
-          updateMeta();
-          resolve();
-        };
-
-        ws.onerror = (err) => {
-          clearTimeout(timeout);
-          console.error('[WS] error', err);
-          setStatus('ws_error');
-          reject(new Error('WebSocket error'));
-        };
-
-        ws.onclose = () => {
-          console.log('[WS] closed');
-          stopPing();
-          setStatus('ws_closed');
-          updateMeta();
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            console.log('[WS] message', msg);
-
-            if (msg.type === 'status') {
-              setStatus(msg.status);
-            }
-
-            if (msg.type === 'live_cn') {
-              currentLiveCn = msg.text || '';
-              cnEl.value = currentLiveCn;
-            }
-
-            if (msg.type === 'final') {
-              appendLine(cnEl, msg.cn);
-              appendLine(enEl, msg.en);
-            }
-
-            if (msg.type === 'manual_result') {
-              appendLine(cnEl, msg.cn);
-              appendLine(enEl, msg.en);
-            }
-
-            if (msg.type === 'error') {
-              console.error('[Server error]', msg.message);
-              setStatus(`error: ${msg.message}`);
-            }
-          } catch (err) {
-            console.error('[WS] bad message', err);
-          }
-        };
-      });
+    function stopKeepAlive() {
+      if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+      }
     }
 
-    async function startAudioPipeline() {
+    async function startAudio() {
       setStatus('mic_permission');
 
-      micStream = await navigator.mediaDevices.getUserMedia({
+      mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           echoCancellation: true,
@@ -244,47 +213,44 @@
         }
       });
 
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      audioContext = new (window.AudioContext || window.webkitAudioContext)({
         latencyHint: 'interactive'
       });
 
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
       }
 
-      console.log('[Audio] sampleRate', audioCtx.sampleRate);
+      console.log('[Audio] input sampleRate', audioContext.sampleRate);
 
-      await audioCtx.audioWorklet.addModule('/pcm16-worklet.js');
+      await audioContext.audioWorklet.addModule('/pcm16-worklet.js');
 
-      sourceNode = audioCtx.createMediaStreamSource(micStream);
-
-      workletNode = new AudioWorkletNode(audioCtx, 'pcm16-worklet', {
+      sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      workletNode = new AudioWorkletNode(audioContext, 'pcm16-worklet', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1],
         processorOptions: {
           targetSampleRate: 16000,
-          chunkSamples: 1600
+          frameSamples: 1600
         }
       });
 
-      zeroGainNode = audioCtx.createGain();
+      zeroGainNode = audioContext.createGain();
       zeroGainNode.gain.value = 0;
 
       workletNode.port.onmessage = (event) => {
-        const payload = event.data || {};
-        if (payload.type !== 'pcm') return;
+        const msg = event.data;
+        if (!msg || msg.type !== 'pcm') return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
         try {
-          ws.send(payload.buffer);
-          frameCount += 1;
-          lastSentBytes = payload.bytes || 0;
-
-          if (frameCount % 10 === 0) {
-            console.log('[Audio] sent frames', frameCount, 'last bytes', lastSentBytes);
+          ws.send(msg.buffer);
+          sentFrameCount++;
+          lastBytes = msg.bytes || 0;
+          if (sentFrameCount % 10 === 0) {
+            console.log('[Audio] sent frames', sentFrameCount, 'last bytes', lastBytes);
           }
-
           updateMeta();
         } catch (err) {
           console.error('[Audio] send failed', err);
@@ -293,48 +259,103 @@
 
       sourceNode.connect(workletNode);
       workletNode.connect(zeroGainNode);
-      zeroGainNode.connect(audioCtx.destination);
+      zeroGainNode.connect(audioContext.destination);
 
-      console.log('[Audio] pipeline active');
+      console.log('[Audio] worklet pipeline active');
       setStatus('streaming_pcm16_16k');
       updateMeta();
     }
 
     async function start() {
-      if (running) return;
-
-      running = true;
-      frameCount = 0;
-      lastSentBytes = 0;
-      currentLiveCn = '';
-      cnEl.value = '';
-      enEl.value = '';
+      if (isRunning) return;
+      isRunning = true;
+      sentFrameCount = 0;
+      lastBytes = 0;
 
       btnStart.disabled = true;
       btnStop.disabled = false;
+      cnEl.value = '';
+      enEl.value = '';
 
-      try {
-        setStatus('connecting');
-        await openWebSocket();
-        await startAudioPipeline();
-      } catch (err) {
-        console.error('[UI] start failed', err);
-        await stop(true);
-      }
+      setStatus('connecting');
+
+      ws = new WebSocket(wsUrl());
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = async () => {
+        console.log('[WS] open');
+        setStatus('ws_open');
+        startKeepAlive();
+
+        try {
+          await startAudio();
+        } catch (err) {
+          console.error('[Audio] start failed', err);
+          setStatus('audio_error');
+        }
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          console.log('[WS] message', msg);
+
+          if (msg.type === 'status') {
+            setStatus(msg.status);
+          }
+
+          if (msg.type === 'live_cn') {
+            cnEl.value = msg.text || '';
+          }
+
+          if (msg.type === 'final') {
+            appendLine(cnEl, msg.cn);
+            appendLine(enEl, msg.en);
+          }
+
+          if (msg.type === 'manual_result') {
+            appendLine(cnEl, msg.cn);
+            appendLine(enEl, msg.en);
+          }
+
+          if (msg.type === 'error') {
+            console.error('[Server error]', msg.message);
+            setStatus(`error`);
+          }
+        } catch (err) {
+          console.error('[WS] bad message', err);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('[WS] closed');
+        stopKeepAlive();
+        setStatus('ws_closed');
+        updateMeta();
+      };
+
+      ws.onerror = (err) => {
+        console.error('[WS] error', err);
+        setStatus('ws_error');
+      };
+
+      updateMeta();
     }
 
-    async function stop(internal = false) {
-      console.log(internal ? '[UI] internal stop' : '[UI] manual stop');
+    async function stop() {
+      console.log('[UI] manual stop');
+      isRunning = false;
+      stopKeepAlive();
 
-      running = false;
-      stopPing();
-
-      try {
-        if (workletNode) workletNode.disconnect();
-      } catch (_) {}
+      btnStart.disabled = false;
+      btnStop.disabled = true;
 
       try {
         if (sourceNode) sourceNode.disconnect();
+      } catch (_) {}
+
+      try {
+        if (workletNode) workletNode.disconnect();
       } catch (_) {}
 
       try {
@@ -342,14 +363,14 @@
       } catch (_) {}
 
       try {
-        if (micStream) {
-          micStream.getTracks().forEach(track => track.stop());
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(track => track.stop());
         }
       } catch (_) {}
 
       try {
-        if (audioCtx && audioCtx.state !== 'closed') {
-          await audioCtx.close();
+        if (audioContext && audioContext.state !== 'closed') {
+          await audioContext.close();
         }
       } catch (_) {}
 
@@ -359,35 +380,32 @@
         }
       } catch (_) {}
 
-      ws = null;
-      audioCtx = null;
-      micStream = null;
       sourceNode = null;
       workletNode = null;
       zeroGainNode = null;
-
-      btnStart.disabled = false;
-      btnStop.disabled = true;
+      mediaStream = null;
+      audioContext = null;
+      ws = null;
 
       setStatus('idle');
       updateMeta();
     }
 
-    btnStart.addEventListener('click', start);
-    btnStop.addEventListener('click', () => stop(false));
+    btnStart.onclick = start;
+    btnStop.onclick = stop;
 
     document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState === 'visible' && audioCtx && audioCtx.state === 'suspended') {
+      if (document.visibilityState === 'visible' && audioContext && audioContext.state === 'suspended') {
         try {
-          await audioCtx.resume();
-          console.log('[Audio] resumed after visibility change');
+          await audioContext.resume();
+          console.log('[Audio] resumed');
           updateMeta();
         } catch (_) {}
       }
     });
 
     window.addEventListener('beforeunload', () => {
-      stop(true);
+      stop();
     });
 
     updateMeta();
