@@ -16,13 +16,11 @@ const server = createServer(app);
 // --------------------
 const PORT = process.env.PORT || 8080;
 
-// Your exact Railway variable names
 const ALIBABA_AK_ID = process.env.ALIBABA_AK_ID;
 const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET;
 const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-// Keep everything in Singapore region
 const REGION = 'ap-southeast-1';
 const ALIBABA_WS_BASE = `wss://nls-gateway-${REGION}.aliyuncs.com/ws/v1`;
 const ALIBABA_TOKEN_ENDPOINT = `https://nlsmeta.${REGION}.aliyuncs.com`;
@@ -50,6 +48,14 @@ function safeJsonSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
+}
+
+function safeWsSend(ws, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(data);
+    return true;
+  }
+  return false;
 }
 
 // --------------------
@@ -96,7 +102,7 @@ async function createAlibabaTokenViaSDK() {
 
 async function ensureAlibabaTokenFresh() {
   const nowSec = Math.floor(Date.now() / 1000);
-  const refreshWindowSec = 300; // refresh if less than 5 mins left
+  const refreshWindowSec = 300;
 
   if (
     tokenState.id &&
@@ -198,6 +204,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (clientWs) => {
   console.log('[WS] Client connected');
 
+  let clientAlive = true;
   let alibabaWs = null;
   let alibabaReady = false;
   let alibabaConnecting = false;
@@ -206,7 +213,7 @@ wss.on('connection', (clientWs) => {
 
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds at 16k mono PCM16
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2;
 
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
@@ -222,7 +229,8 @@ wss.on('connection', (clientWs) => {
   }
 
   function scheduleReconnect(reason) {
-    if (clientWs.readyState !== WebSocket.OPEN) return;
+    if (!clientAlive) return;
+    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
     if (reconnectTimer) return;
 
     reconnectAttempts += 1;
@@ -231,16 +239,21 @@ wss.on('connection', (clientWs) => {
 
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
+      if (!clientAlive) return;
       connectAlibabaIfNeeded(true).catch((e) => {
         console.error('[Alibaba] Reconnect failed:', e?.message || e);
       });
     }, delay);
   }
 
-  function closeAlibaba() {
+  function closeAlibaba(sendStop = true) {
     clearReconnectTimer();
 
-    if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
+    if (
+      sendStop &&
+      alibabaWs &&
+      alibabaWs.readyState === WebSocket.OPEN
+    ) {
       try {
         const stop = {
           header: {
@@ -252,12 +265,18 @@ wss.on('connection', (clientWs) => {
           },
           payload: {},
         };
-        alibabaWs.send(JSON.stringify(stop));
+        safeWsSend(alibabaWs, JSON.stringify(stop));
       } catch (_) {}
     }
 
     try {
-      alibabaWs?.close();
+      if (
+        alibabaWs &&
+        (alibabaWs.readyState === WebSocket.OPEN ||
+          alibabaWs.readyState === WebSocket.CONNECTING)
+      ) {
+        alibabaWs.close();
+      }
     } catch (_) {}
 
     alibabaWs = null;
@@ -266,10 +285,11 @@ wss.on('connection', (clientWs) => {
   }
 
   async function connectAlibabaIfNeeded(force = false) {
+    if (!clientAlive) return;
     if (alibabaWs && !force) return;
     if (alibabaConnecting && !force) return;
 
-    if (force) closeAlibaba();
+    if (force) closeAlibaba(false);
 
     alibabaConnecting = true;
 
@@ -313,7 +333,10 @@ wss.on('connection', (clientWs) => {
         },
       };
 
-      alibabaWs.send(JSON.stringify(start));
+      const sent = safeWsSend(alibabaWs, JSON.stringify(start));
+      if (!sent) {
+        console.error('[Alibaba] Failed to send StartTranscriber because socket was not open');
+      }
     });
 
     alibabaWs.on('message', async (data) => {
@@ -336,9 +359,7 @@ wss.on('connection', (clientWs) => {
         while (audioBufferQueue.length) {
           const chunk = audioBufferQueue.shift();
           bufferedBytes -= chunk.length;
-          if (alibabaWs.readyState === WebSocket.OPEN) {
-            alibabaWs.send(chunk);
-          }
+          if (!safeWsSend(alibabaWs, chunk)) break;
         }
         return;
       }
@@ -369,15 +390,20 @@ wss.on('connection', (clientWs) => {
       }
 
       if (eventName === 'TaskFailed') {
-        const statusMsg = msg?.header?.status_message || 'unknown';
-        console.error('[Alibaba] TaskFailed:', statusMsg);
+        console.error('[Alibaba] TaskFailed FULL >>>', JSON.stringify(msg));
+
+        const statusMsg =
+          msg?.header?.status_message ||
+          msg?.header?.message ||
+          msg?.payload?.message ||
+          'unknown';
 
         safeJsonSend(clientWs, {
           type: 'error',
           message: `Alibaba task failed: ${statusMsg}`,
         });
 
-        closeAlibaba();
+        closeAlibaba(false);
 
         tokenState.id = null;
         tokenState.expireTimeSec = null;
@@ -391,13 +417,19 @@ wss.on('connection', (clientWs) => {
       alibabaReady = false;
       alibabaWs = null;
       alibabaConnecting = false;
-      scheduleReconnect(`ws_close:${code}`);
+
+      if (clientAlive) {
+        scheduleReconnect(`ws_close:${code}`);
+      }
     });
 
     alibabaWs.on('error', (err) => {
       console.error('[Alibaba] WS error:', err?.message || err);
       safeJsonSend(clientWs, { type: 'error', message: 'Alibaba WS error' });
-      scheduleReconnect('ws_error');
+
+      if (clientAlive) {
+        scheduleReconnect('ws_error');
+      }
     });
   }
 
@@ -423,9 +455,7 @@ wss.on('connection', (clientWs) => {
         return;
       }
 
-      if (alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
-        alibabaWs.send(buf);
-      }
+      safeWsSend(alibabaWs, buf);
       return;
     }
 
@@ -462,13 +492,15 @@ wss.on('connection', (clientWs) => {
   }, 5000);
 
   clientWs.on('close', () => {
+    clientAlive = false;
     clearInterval(interval);
     console.log('[WS] Client disconnected');
-    closeAlibaba();
+    closeAlibaba(false);
   });
 
   clientWs.on('error', (err) => {
+    clientAlive = false;
     console.error('[WS] Client error:', err?.message || err);
-    closeAlibaba();
+    closeAlibaba(false);
   });
 });
