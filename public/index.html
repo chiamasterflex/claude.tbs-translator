@@ -5,124 +5,144 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>TBS Live Translator</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
-    .row { display: flex; gap: 16px; }
-    .col { flex: 1; }
-    textarea { width: 100%; height: 260px; }
-    button { padding: 10px 14px; margin-right: 8px; }
-    .status { margin: 10px 0; }
-    code { background: #f4f4f4; padding: 1px 4px; border-radius: 4px; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 20px;
+      color: #111;
+    }
+
+    h1 {
+      margin-bottom: 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    button {
+      padding: 10px 16px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      font-size: 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 12px;
+    }
+
+    .panel h3 {
+      margin: 0 0 8px 0;
+      font-size: 20px;
+    }
+
+    textarea {
+      width: 100%;
+      height: 360px;
+      box-sizing: border-box;
+      resize: vertical;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .meta {
+      margin-top: 14px;
+      font-size: 12px;
+      color: #666;
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
   <h1>TBS Live Translator</h1>
 
-  <div>
+  <div class="toolbar">
     <button id="btnStart">Start</button>
     <button id="btnStop" disabled>Stop</button>
-    <span class="status">Status: <span id="status">idle</span></span>
+    <div class="status">Status: <span id="status">idle</span></div>
   </div>
 
-  <div class="row">
-    <div class="col">
+  <div class="grid">
+    <div class="panel">
       <h3>Live Chinese</h3>
       <textarea id="cn" readonly></textarea>
     </div>
-    <div class="col">
+    <div class="panel">
       <h3>English</h3>
       <textarea id="en" readonly></textarea>
     </div>
   </div>
 
+  <div class="meta" id="meta"></div>
+
   <script>
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
     const statusEl = document.getElementById('status');
     const cnEl = document.getElementById('cn');
     const enEl = document.getElementById('en');
-    const btnStart = document.getElementById('btnStart');
-    const btnStop = document.getElementById('btnStop');
+    const metaEl = document.getElementById('meta');
 
     let ws = null;
     let audioCtx = null;
     let micStream = null;
     let sourceNode = null;
-    let processorNode = null;
+    let workletNode = null;
     let zeroGainNode = null;
-    let streamActive = false;
     let pingTimer = null;
-    let started = false;
-    let sentFrames = 0;
 
-    function setStatus(s) {
-      statusEl.textContent = s;
-      console.log('[UI]', s);
+    let running = false;
+    let frameCount = 0;
+    let lastSentBytes = 0;
+    let currentLiveCn = '';
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+      console.log('[UI]', text);
     }
 
-    function wsUrl() {
+    function updateMeta() {
+      metaEl.textContent =
+        `frames sent: ${frameCount}\n` +
+        `last bytes: ${lastSentBytes}\n` +
+        `ws readyState: ${ws ? ws.readyState : 'none'}\n` +
+        `audio state: ${audioCtx ? audioCtx.state : 'none'}`;
+    }
+
+    function getWsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${proto}//${location.host}/ws`;
     }
 
     function appendLine(el, text) {
-      el.value = (el.value + (el.value ? '\n' : '') + text).slice(-30000);
+      if (!text) return;
+      el.value = (el.value + (el.value ? '\n' : '') + text).slice(-50000);
       el.scrollTop = el.scrollHeight;
-    }
-
-    function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
-      if (outputSampleRate === inputSampleRate) return buffer;
-      if (outputSampleRate > inputSampleRate) {
-        throw new Error('Output sample rate must be <= input sample rate');
-      }
-
-      const sampleRateRatio = inputSampleRate / outputSampleRate;
-      const newLength = Math.round(buffer.length / sampleRateRatio);
-      const result = new Float32Array(newLength);
-
-      let offsetResult = 0;
-      let offsetBuffer = 0;
-
-      while (offsetResult < result.length) {
-        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-        let accum = 0;
-        let count = 0;
-
-        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-          accum += buffer[i];
-          count++;
-        }
-
-        result[offsetResult] = count > 0 ? accum / count : 0;
-        offsetResult++;
-        offsetBuffer = nextOffsetBuffer;
-      }
-
-      return result;
-    }
-
-    function floatTo16BitPCM(float32Array) {
-      const buffer = new ArrayBuffer(float32Array.length * 2);
-      const view = new DataView(buffer);
-
-      let offset = 0;
-      for (let i = 0; i < float32Array.length; i++, offset += 2) {
-        let s = Math.max(-1, Math.min(1, float32Array[i]));
-        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-      }
-
-      return buffer;
-    }
-
-    function startPing() {
-      stopPing();
-      pingTimer = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
-            console.log('[WS] ping');
-          } catch (err) {
-            console.error('[WS] ping failed', err);
-          }
-        }
-      }, 5000);
     }
 
     function stopPing() {
@@ -132,90 +152,185 @@
       }
     }
 
+    function startPing() {
+      stopPing();
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+          } catch (err) {
+            console.error('[WS] ping failed', err);
+          }
+        }
+      }, 5000);
+    }
+
+    async function openWebSocket() {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(getWsUrl());
+        ws.binaryType = 'arraybuffer';
+
+        const timeout = setTimeout(() => {
+          reject(new Error('WebSocket open timeout'));
+        }, 10000);
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          console.log('[WS] open');
+          setStatus('ws_open');
+          startPing();
+          updateMeta();
+          resolve();
+        };
+
+        ws.onerror = (err) => {
+          clearTimeout(timeout);
+          console.error('[WS] error', err);
+          setStatus('ws_error');
+          reject(new Error('WebSocket error'));
+        };
+
+        ws.onclose = () => {
+          console.log('[WS] closed');
+          stopPing();
+          setStatus('ws_closed');
+          updateMeta();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            console.log('[WS] message', msg);
+
+            if (msg.type === 'status') {
+              setStatus(msg.status);
+            }
+
+            if (msg.type === 'live_cn') {
+              currentLiveCn = msg.text || '';
+              cnEl.value = currentLiveCn;
+            }
+
+            if (msg.type === 'final') {
+              appendLine(cnEl, msg.cn);
+              appendLine(enEl, msg.en);
+            }
+
+            if (msg.type === 'manual_result') {
+              appendLine(cnEl, msg.cn);
+              appendLine(enEl, msg.en);
+            }
+
+            if (msg.type === 'error') {
+              console.error('[Server error]', msg.message);
+              setStatus(`error: ${msg.message}`);
+            }
+          } catch (err) {
+            console.error('[WS] bad message', err);
+          }
+        };
+      });
+    }
+
+    async function startAudioPipeline() {
+      setStatus('mic_permission');
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false
+        }
+      });
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+        latencyHint: 'interactive'
+      });
+
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      console.log('[Audio] sampleRate', audioCtx.sampleRate);
+
+      await audioCtx.audioWorklet.addModule('/pcm16-worklet.js');
+
+      sourceNode = audioCtx.createMediaStreamSource(micStream);
+
+      workletNode = new AudioWorkletNode(audioCtx, 'pcm16-worklet', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: {
+          targetSampleRate: 16000,
+          chunkSamples: 1600
+        }
+      });
+
+      zeroGainNode = audioCtx.createGain();
+      zeroGainNode.gain.value = 0;
+
+      workletNode.port.onmessage = (event) => {
+        const payload = event.data || {};
+        if (payload.type !== 'pcm') return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        try {
+          ws.send(payload.buffer);
+          frameCount += 1;
+          lastSentBytes = payload.bytes || 0;
+
+          if (frameCount % 10 === 0) {
+            console.log('[Audio] sent frames', frameCount, 'last bytes', lastSentBytes);
+          }
+
+          updateMeta();
+        } catch (err) {
+          console.error('[Audio] send failed', err);
+        }
+      };
+
+      sourceNode.connect(workletNode);
+      workletNode.connect(zeroGainNode);
+      zeroGainNode.connect(audioCtx.destination);
+
+      console.log('[Audio] pipeline active');
+      setStatus('streaming_pcm16_16k');
+      updateMeta();
+    }
+
     async function start() {
-      if (started) return;
-      started = true;
-      sentFrames = 0;
+      if (running) return;
+
+      running = true;
+      frameCount = 0;
+      lastSentBytes = 0;
+      currentLiveCn = '';
+      cnEl.value = '';
+      enEl.value = '';
 
       btnStart.disabled = true;
       btnStop.disabled = false;
-      cnEl.value = '';
-      enEl.value = '';
-      setStatus('connecting');
-
-      ws = new WebSocket(wsUrl());
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = async () => {
-        console.log('[WS] open');
-        setStatus('ws_open');
-        startPing();
-
-        try {
-          await startAudio();
-        } catch (err) {
-          console.error('[Audio] start failed', err);
-          setStatus('audio_error');
-        }
-      };
-
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          console.log('[WS] message', msg);
-
-          if (msg.type === 'status') {
-            setStatus(msg.status);
-          }
-
-          if (msg.type === 'live_cn') {
-            cnEl.value = msg.text;
-          }
-
-          if (msg.type === 'final') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'manual_result') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'error') {
-            console.error('[Server error]', msg.message);
-            setStatus('error');
-          }
-        } catch (err) {
-          console.error('[WS] bad message', err);
-        }
-      };
-
-      ws.onclose = () => {
-        console.log('[WS] closed');
-        stopPing();
-        setStatus('ws_closed');
-        // IMPORTANT: do not auto-stop audio here.
-        // We only stop on manual Stop button.
-      };
-
-      ws.onerror = (err) => {
-        console.error('[WS] error', err);
-        setStatus('ws_error');
-      };
-    }
-
-    async function stop() {
-      console.log('[UI] manual stop');
-      started = false;
-      streamActive = false;
-      stopPing();
-
-      btnStart.disabled = false;
-      btnStop.disabled = true;
 
       try {
-        if (processorNode) processorNode.disconnect();
+        setStatus('connecting');
+        await openWebSocket();
+        await startAudioPipeline();
+      } catch (err) {
+        console.error('[UI] start failed', err);
+        await stop(true);
+      }
+    }
+
+    async function stop(internal = false) {
+      console.log(internal ? '[UI] internal stop' : '[UI] manual stop');
+
+      running = false;
+      stopPing();
+
+      try {
+        if (workletNode) workletNode.disconnect();
       } catch (_) {}
 
       try {
@@ -244,89 +359,38 @@
         }
       } catch (_) {}
 
-      processorNode = null;
-      sourceNode = null;
-      zeroGainNode = null;
-      micStream = null;
-      audioCtx = null;
       ws = null;
+      audioCtx = null;
+      micStream = null;
+      sourceNode = null;
+      workletNode = null;
+      zeroGainNode = null;
+
+      btnStart.disabled = false;
+      btnStop.disabled = true;
 
       setStatus('idle');
+      updateMeta();
     }
 
-    btnStart.onclick = start;
-    btnStop.onclick = stop;
-
-    async function startAudio() {
-      setStatus('mic_permission');
-
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false
-        }
-      });
-
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
-
-      console.log('[Audio] sampleRate', audioCtx.sampleRate);
-      setStatus(`audio_${audioCtx.sampleRate}hz`);
-
-      sourceNode = audioCtx.createMediaStreamSource(micStream);
-      const bufferSize = 4096;
-      processorNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-
-      // Keep processor alive without audible output
-      zeroGainNode = audioCtx.createGain();
-      zeroGainNode.gain.value = 0;
-
-      processorNode.onaudioprocess = (event) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        const inputData = event.inputBuffer.getChannelData(0);
-        const downsampled = downsampleBuffer(inputData, audioCtx.sampleRate, 16000);
-        const pcmBuffer = floatTo16BitPCM(downsampled);
-
-        if (pcmBuffer.byteLength < 640) return;
-
-        try {
-          ws.send(pcmBuffer);
-          streamActive = true;
-          sentFrames++;
-          if (sentFrames % 10 === 0) {
-            console.log('[Audio] sent frames', sentFrames, 'last bytes', pcmBuffer.byteLength);
-          }
-        } catch (err) {
-          console.error('[Audio] send failed', err);
-        }
-      };
-
-      sourceNode.connect(processorNode);
-      processorNode.connect(zeroGainNode);
-      zeroGainNode.connect(audioCtx.destination);
-
-      setStatus('streaming_pcm16_16k');
-      console.log('[Audio] pipeline active');
-    }
+    btnStart.addEventListener('click', start);
+    btnStop.addEventListener('click', () => stop(false));
 
     document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState === 'visible' && audioCtx && audioCtx.state === 'suspended') {
         try {
           await audioCtx.resume();
           console.log('[Audio] resumed after visibility change');
+          updateMeta();
         } catch (_) {}
       }
     });
 
     window.addEventListener('beforeunload', () => {
-      stop();
+      stop(true);
     });
+
+    updateMeta();
   </script>
 </body>
 </html>
