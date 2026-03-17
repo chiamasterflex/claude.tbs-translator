@@ -102,13 +102,23 @@ async function createAlibabaNlsTokenViaOpenAPI() {
   const qs = `Signature=${percentEncode(signature)}&${buildCanonicalizedQuery(params)}`;
   const url = `${NLS_META_BASE}?${qs}`;
 
-  const resp = await axios.get(url, {
+ let resp;
+
+try {
+  resp = await axios.get(url, {
     timeout: 15000,
     headers: {
       Host: NLS_META_HOST,
       Accept: 'application/json',
     },
   });
+} catch (err) {
+  console.error('❌ FULL ALIBABA ERROR >>>');
+  console.error(err.response?.data || err.message);
+  console.error('❌ REQUEST URL >>>');
+  console.error(url.replace(/Signature=[^&]+/, 'Signature=***'));
+  throw err;
+}
 
   const tokenId = resp.data?.Token?.Id;
   const expireTime = resp.data?.Token?.ExpireTime;
