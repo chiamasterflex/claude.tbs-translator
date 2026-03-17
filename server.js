@@ -59,7 +59,7 @@ function safeWsSend(ws, data) {
 }
 
 // --------------------
-// Alibaba token manager using SDK
+// Alibaba token manager
 // --------------------
 const tokenState = {
   id: null,
@@ -133,7 +133,6 @@ async function ensureAlibabaTokenFresh() {
   }
 }
 
-// Warm token on startup
 ensureAlibabaTokenFresh().catch((e) => {
   console.error('[Startup] Alibaba token warmup failed:', e?.message || e);
 });
@@ -206,26 +205,21 @@ wss.on('connection', (clientWs) => {
 
   let clientAlive = true;
   let alibabaWs = null;
-  let alibabaReady = false;
   let alibabaConnecting = false;
-  let keepAlive = null;
+  let alibabaStarted = false;   // StartTranscriber has been sent
+  let alibabaReady = false;     // optional informational state
   let reconnectTimer = null;
   let reconnectAttempts = 0;
 
   const taskId = newId();
 
+  // Only buffer until Alibaba socket is open and StartTranscriber is sent.
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds buffered audio
+  const MAX_BUFFER_BYTES = 16000 * 2 * 3; // ~3 seconds
+
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
-
-  function clearKeepAlive() {
-    if (keepAlive) {
-      clearInterval(keepAlive);
-      keepAlive = null;
-    }
-  }
 
   function clearReconnectTimer() {
     if (reconnectTimer) {
@@ -235,14 +229,9 @@ wss.on('connection', (clientWs) => {
   }
 
   function closeAlibaba(sendStop = true) {
-    clearKeepAlive();
     clearReconnectTimer();
 
-    if (
-      sendStop &&
-      alibabaWs &&
-      alibabaWs.readyState === WebSocket.OPEN
-    ) {
+    if (sendStop && alibabaWs && alibabaWs.readyState === WebSocket.OPEN) {
       try {
         const stop = {
           header: {
@@ -269,8 +258,9 @@ wss.on('connection', (clientWs) => {
     } catch (_) {}
 
     alibabaWs = null;
-    alibabaReady = false;
     alibabaConnecting = false;
+    alibabaStarted = false;
+    alibabaReady = false;
   }
 
   function scheduleReconnect(reason) {
@@ -281,7 +271,7 @@ wss.on('connection', (clientWs) => {
     if (alibabaWs) return;
 
     reconnectAttempts += 1;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000);
     console.log(`[Alibaba] Reconnect scheduled in ${delay}ms. Reason: ${reason}`);
 
     reconnectTimer = setTimeout(() => {
@@ -291,6 +281,18 @@ wss.on('connection', (clientWs) => {
         console.error('[Alibaba] Reconnect failed:', e?.message || e);
       });
     }, delay);
+  }
+
+  async function flushBufferedAudio() {
+    if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) return;
+    if (!alibabaStarted) return;
+
+    while (audioBufferQueue.length) {
+      const chunk = audioBufferQueue.shift();
+      bufferedBytes -= chunk.length;
+      const ok = safeWsSend(alibabaWs, chunk);
+      if (!ok) break;
+    }
   }
 
   async function connectAlibabaIfNeeded(force = false) {
@@ -321,11 +323,11 @@ wss.on('connection', (clientWs) => {
 
     alibabaWs = new WebSocket(url);
 
-    alibabaWs.on('open', () => {
+    alibabaWs.on('open', async () => {
       console.log('[Alibaba] WS open');
       reconnectAttempts = 0;
 
-      setTimeout(() => {
+      setTimeout(async () => {
         if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) {
           console.error('[Alibaba] Socket not open when trying to send StartTranscriber');
           return;
@@ -348,17 +350,18 @@ wss.on('connection', (clientWs) => {
           },
         };
 
-        safeWsSend(alibabaWs, JSON.stringify(start));
+        const ok = safeWsSend(alibabaWs, JSON.stringify(start));
+        if (!ok) {
+          console.error('[Alibaba] Failed to send StartTranscriber');
+          return;
+        }
+
+        alibabaStarted = true;
+        alibabaConnecting = false;
         console.log('[Alibaba] StartTranscriber sent');
 
-        // Send silence frames until Alibaba becomes ready
-        const silence = Buffer.alloc(3200);
-        clearKeepAlive();
-        keepAlive = setInterval(() => {
-          if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) return;
-          if (alibabaReady) return;
-          safeWsSend(alibabaWs, silence);
-        }, 100);
+        // IMPORTANT: flush real buffered audio immediately after start
+        await flushBufferedAudio();
       }, 50);
     });
 
@@ -375,17 +378,8 @@ wss.on('connection', (clientWs) => {
 
       if (eventName === 'TranscriptionStarted') {
         alibabaReady = true;
-        alibabaConnecting = false;
-        clearKeepAlive();
-
-        console.log('[Alibaba] Ready. Flushing buffered audio:', bufferedBytes, 'bytes');
+        console.log('[Alibaba] Ready');
         safeJsonSend(clientWs, { type: 'status', status: 'ready' });
-
-        while (audioBufferQueue.length) {
-          const chunk = audioBufferQueue.shift();
-          bufferedBytes -= chunk.length;
-          if (!safeWsSend(alibabaWs, chunk)) break;
-        }
         return;
       }
 
@@ -430,7 +424,6 @@ wss.on('connection', (clientWs) => {
 
         closeAlibaba(false);
 
-        // force fresh token next time
         tokenState.id = null;
         tokenState.expireTimeSec = null;
 
@@ -440,10 +433,10 @@ wss.on('connection', (clientWs) => {
 
     alibabaWs.on('close', (code, reason) => {
       console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
-      clearKeepAlive();
-      alibabaReady = false;
       alibabaWs = null;
       alibabaConnecting = false;
+      alibabaStarted = false;
+      alibabaReady = false;
 
       if (clientAlive) {
         scheduleReconnect(`ws_close:${code}`);
@@ -474,7 +467,8 @@ wss.on('connection', (clientWs) => {
         console.error('[Alibaba] connect failed:', e?.message || e);
       });
 
-      if (!alibabaReady) {
+      // If not started yet, buffer briefly.
+      if (!alibabaStarted || !alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) {
         if (bufferedBytes + buf.length <= MAX_BUFFER_BYTES) {
           audioBufferQueue.push(buf);
           bufferedBytes += buf.length;
@@ -482,6 +476,7 @@ wss.on('connection', (clientWs) => {
         return;
       }
 
+      // Once started, forward immediately — do NOT wait for "ready"
       safeWsSend(alibabaWs, buf);
       return;
     }
@@ -490,6 +485,12 @@ wss.on('connection', (clientWs) => {
     try {
       msg = JSON.parse(data.toString());
     } catch (e) {
+      return;
+    }
+
+    // harmless browser keepalive ping
+    if (msg?.type === 'ping') {
+      safeJsonSend(clientWs, { type: 'status', status: alibabaReady ? 'ready' : 'alive' });
       return;
     }
 
