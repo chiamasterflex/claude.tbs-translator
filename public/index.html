@@ -10,7 +10,7 @@
     .col { flex: 1; }
     textarea { width: 100%; height: 260px; }
     button { padding: 10px 14px; margin-right: 8px; }
-    .status { margin: 10px 0; opacity: 0.8; }
+    .status { margin: 10px 0; opacity: 0.9; }
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eee; }
     code { background: #f4f4f4; padding: 1px 4px; border-radius: 4px; }
   </style>
@@ -42,9 +42,17 @@
     const btnStart = document.getElementById('btnStart');
     const btnStop = document.getElementById('btnStop');
 
-    let ws, audioCtx, micStream, sourceNode, workletNode;
+    let ws = null;
+    let audioCtx = null;
+    let micStream = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let streamActive = false;
 
-    function setStatus(s) { statusEl.textContent = s; }
+    function setStatus(s) {
+      statusEl.textContent = s;
+      console.log('[UI]', s);
+    }
 
     function wsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -56,49 +64,152 @@
       el.scrollTop = el.scrollHeight;
     }
 
+    function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+      if (outputSampleRate === inputSampleRate) return buffer;
+      if (outputSampleRate > inputSampleRate) {
+        throw new Error('Output sample rate must be <= input sample rate');
+      }
+
+      const sampleRateRatio = inputSampleRate / outputSampleRate;
+      const newLength = Math.round(buffer.length / sampleRateRatio);
+      const result = new Float32Array(newLength);
+
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+
+      while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0;
+        let count = 0;
+
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+          accum += buffer[i];
+          count++;
+        }
+
+        result[offsetResult] = count > 0 ? accum / count : 0;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+      }
+
+      return result;
+    }
+
+    function floatTo16BitPCM(float32Array) {
+      const buffer = new ArrayBuffer(float32Array.length * 2);
+      const view = new DataView(buffer);
+
+      let offset = 0;
+      for (let i = 0; i < float32Array.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+
+      return buffer;
+    }
+
     async function start() {
+      if (streamActive) return;
+
       btnStart.disabled = true;
       btnStop.disabled = false;
+      cnEl.value = '';
+      enEl.value = '';
       setStatus('connecting');
 
       ws = new WebSocket(wsUrl());
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = async () => {
+        console.log('[WS] open');
         setStatus('ws_open');
-        await startAudio();
+        try {
+          await startAudio();
+        } catch (err) {
+          console.error('[Audio] start failed', err);
+          setStatus('audio_error');
+          await stop();
+        }
       };
 
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.type === 'status') setStatus(msg.status);
-          if (msg.type === 'live_cn') cnEl.value = msg.text;
+          console.log('[WS] message', msg);
+
+          if (msg.type === 'status') {
+            setStatus(msg.status);
+          }
+
+          if (msg.type === 'live_cn') {
+            cnEl.value = msg.text;
+          }
+
           if (msg.type === 'final') {
             appendLine(cnEl, msg.cn);
             appendLine(enEl, msg.en);
           }
-          if (msg.type === 'error') setStatus('error: ' + msg.message);
-        } catch (_) {
-          // ignore
+
+          if (msg.type === 'manual_result') {
+            appendLine(cnEl, msg.cn);
+            appendLine(enEl, msg.en);
+          }
+
+          if (msg.type === 'error') {
+            console.error('[Server error]', msg.message);
+            setStatus('error');
+          }
+        } catch (err) {
+          console.error('[WS] bad message', err);
         }
       };
 
-      ws.onclose = () => setStatus('ws_closed');
-      ws.onerror = () => setStatus('ws_error');
+      ws.onclose = () => {
+        console.log('[WS] closed');
+        setStatus('ws_closed');
+      };
+
+      ws.onerror = (err) => {
+        console.error('[WS] error', err);
+        setStatus('ws_error');
+      };
     }
 
     async function stop() {
+      streamActive = false;
       btnStart.disabled = false;
       btnStop.disabled = true;
 
-      try { workletNode?.disconnect(); } catch (_) {}
-      try { sourceNode?.disconnect(); } catch (_) {}
-      try { micStream?.getTracks()?.forEach(t => t.stop()); } catch (_) {}
-      try { await audioCtx?.close(); } catch (_) {}
-      audioCtx = null; micStream = null; sourceNode = null; workletNode = null;
+      try {
+        if (processorNode) processorNode.disconnect();
+      } catch (_) {}
 
-      try { ws?.close(); } catch (_) {}
+      try {
+        if (sourceNode) sourceNode.disconnect();
+      } catch (_) {}
+
+      try {
+        if (micStream) {
+          micStream.getTracks().forEach(track => track.stop());
+        }
+      } catch (_) {}
+
+      try {
+        if (audioCtx && audioCtx.state !== 'closed') {
+          await audioCtx.close();
+        }
+      } catch (_) {}
+
+      try {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close();
+        }
+      } catch (_) {}
+
+      processorNode = null;
+      sourceNode = null;
+      micStream = null;
+      audioCtx = null;
       ws = null;
 
       setStatus('idle');
@@ -115,95 +226,58 @@
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
+          autoGainControl: false
         }
       });
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      setStatus(`audio_ctx_${audioCtx.sampleRate}hz`);
 
-      // Create an AudioWorklet on the fly (no extra file needed)
-      const workletCode = `
-        class Pcm16Downsampler extends AudioWorkletProcessor {
-          constructor() {
-            super();
-            this.inRate = sampleRate;
-            this.outRate = 16000;
-            this.ratio = this.inRate / this.outRate;
-            this._carry = 0;
-            this._last = 0;
-          }
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
 
-          // Convert float [-1,1] to int16
-          _f2i16(x) {
-            x = Math.max(-1, Math.min(1, x));
-            return x < 0 ? x * 0x8000 : x * 0x7FFF;
-          }
-
-          process(inputs) {
-            const input = inputs[0];
-            if (!input || !input[0] || input[0].length === 0) return true;
-
-            const ch = input[0]; // mono
-            const outSamples = [];
-            let idx = 0;
-
-            // Simple downsample by linear interpolation (good enough for ASR)
-            while (idx < ch.length) {
-              const t = this._carry;
-              const i0 = Math.floor(t);
-              const i1 = Math.min(i0 + 1, ch.length - 1);
-
-              // if we don't have enough data for interpolation, break
-              if (i0 >= ch.length) break;
-
-              const frac = t - i0;
-              const s = ch[i0] + (ch[i1] - ch[i0]) * frac;
-              outSamples.push(s);
-
-              this._carry += this.ratio;
-              idx = Math.floor(this._carry);
-              // keep carry bounded so it doesn't explode
-              if (this._carry > 1e9) this._carry = idx;
-              if (idx >= ch.length) {
-                this._carry -= ch.length;
-                break;
-              }
-            }
-
-            // Pack to PCM16 LE
-            const buf = new ArrayBuffer(outSamples.length * 2);
-            const view = new DataView(buf);
-            for (let i = 0; i < outSamples.length; i++) {
-              view.setInt16(i * 2, this._f2i16(outSamples[i]), true);
-            }
-
-            this.port.postMessage(buf, [buf]);
-            return true;
-          }
-        }
-        registerProcessor('pcm16-downsampler', Pcm16Downsampler);
-      `;
-
-      const blob = new Blob([workletCode], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-      await audioCtx.audioWorklet.addModule(url);
-      URL.revokeObjectURL(url);
+      console.log('[Audio] sampleRate', audioCtx.sampleRate);
+      setStatus(`audio_${audioCtx.sampleRate}hz`);
 
       sourceNode = audioCtx.createMediaStreamSource(micStream);
-      workletNode = new AudioWorkletNode(audioCtx, 'pcm16-downsampler');
 
-      workletNode.port.onmessage = (ev) => {
+      // ScriptProcessor is deprecated but far more predictable here than the current worklet setup.
+      const bufferSize = 4096;
+      processorNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+
+      processorNode.onaudioprocess = (event) => {
+        if (!streamActive && ws && ws.readyState === WebSocket.OPEN) {
+          streamActive = true;
+        }
+
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        // ev.data is an ArrayBuffer of PCM16@16k
-        ws.send(ev.data);
+
+        const inputData = event.inputBuffer.getChannelData(0);
+        const downsampled = downsampleBuffer(inputData, audioCtx.sampleRate, 16000);
+        const pcmBuffer = floatTo16BitPCM(downsampled);
+
+        // Ignore absurdly tiny frames
+        if (pcmBuffer.byteLength < 640) return;
+
+        try {
+          ws.send(pcmBuffer);
+          console.log('[Audio] sent bytes', pcmBuffer.byteLength);
+        } catch (err) {
+          console.error('[Audio] send failed', err);
+        }
       };
 
-      // connect (worklet doesn't need to go to destination)
-      sourceNode.connect(workletNode);
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioCtx.destination);
 
+      streamActive = true;
       setStatus('streaming_pcm16_16k');
+      console.log('[Audio] pipeline active');
     }
+
+    window.addEventListener('beforeunload', () => {
+      stop();
+    });
   </script>
 </body>
 </html>
