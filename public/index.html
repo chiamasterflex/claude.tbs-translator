@@ -1,36 +1,18 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>TBS Live Translator</title>
-  <style>
-    body { font-family: system-ui; margin: 20px; }
-    .row { display: flex; gap: 16px; }
-    .col { flex: 1; }
-    textarea { width: 100%; height: 260px; }
-    button { padding: 10px 14px; margin-right: 8px; }
-  </style>
+  <title>TBS Translator</title>
 </head>
 <body>
 
-<h2>TBS Live Translator</h2>
+<button onclick="start()">Start</button>
+<button onclick="stop()">Stop</button>
 
-<button id="start">Start</button>
-<button id="stop" disabled>Stop</button>
+<p id="status">idle</p>
 
-<p>Status: <span id="status">idle</span></p>
-
-<div class="row">
-  <div class="col">
-    <h3>Chinese</h3>
-    <textarea id="cn"></textarea>
-  </div>
-  <div class="col">
-    <h3>English</h3>
-    <textarea id="en"></textarea>
-  </div>
-</div>
+<textarea id="cn" style="width:45%;height:300px"></textarea>
+<textarea id="en" style="width:45%;height:300px"></textarea>
 
 <script>
 let ws;
@@ -38,74 +20,27 @@ let audioCtx;
 let processor;
 let source;
 let stream;
-
-const statusEl = document.getElementById('status');
-const cnEl = document.getElementById('cn');
-const enEl = document.getElementById('en');
+let running = false;
 
 function setStatus(s) {
-  statusEl.textContent = s;
+  document.getElementById('status').innerText = s;
   console.log('[STATUS]', s);
 }
 
 function wsUrl() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return proto + '//' + location.host + '/ws';
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
 }
 
-function append(el, text) {
-  el.value += text + '\n';
-  el.scrollTop = el.scrollHeight;
-}
-
-function downsample(buffer, inRate, outRate) {
-  if (inRate === outRate) return buffer;
-
-  const ratio = inRate / outRate;
-  const newLen = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLen);
-
-  let offset = 0;
-
-  for (let i = 0; i < newLen; i++) {
-    const next = Math.round((i + 1) * ratio);
-    let sum = 0;
-    let count = 0;
-
-    for (let j = offset; j < next && j < buffer.length; j++) {
-      sum += buffer[j];
-      count++;
-    }
-
-    result[i] = sum / count;
-    offset = next;
-  }
-
-  return result;
-}
-
-function toPCM(float32) {
-  const buf = new ArrayBuffer(float32.length * 2);
-  const view = new DataView(buf);
-
-  let i = 0;
-  for (let j = 0; j < float32.length; j++, i += 2) {
-    let s = Math.max(-1, Math.min(1, float32[j]));
-    view.setInt16(i, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-
-  return buf;
-}
-
-document.getElementById('start').onclick = async () => {
-  setStatus('connecting');
+function start() {
+  if (running) return;
+  running = true;
 
   ws = new WebSocket(wsUrl());
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = async () => {
     console.log('[WS] open');
-    setStatus('mic');
+    setStatus('connected');
 
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
@@ -115,16 +50,16 @@ document.getElementById('start').onclick = async () => {
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
     processor.onaudioprocess = (e) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!ws || ws.readyState !== 1) return;
 
       const input = e.inputBuffer.getChannelData(0);
-      const down = downsample(input, audioCtx.sampleRate, 16000);
-      const pcm = toPCM(down);
 
-      if (pcm.byteLength < 1000) return;
+      const pcm = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        pcm[i] = Math.max(-1, Math.min(1, input[i])) * 32767;
+      }
 
-      ws.send(pcm);
-      console.log('[SEND]', pcm.byteLength);
+      ws.send(pcm.buffer);
     };
 
     source.connect(processor);
@@ -137,16 +72,12 @@ document.getElementById('start').onclick = async () => {
     const msg = JSON.parse(e.data);
 
     if (msg.type === 'live_cn') {
-      cnEl.value = msg.text;
+      document.getElementById('cn').value = msg.text;
     }
 
     if (msg.type === 'final') {
-      append(cnEl, msg.cn);
-      append(enEl, msg.en);
-    }
-
-    if (msg.type === 'status') {
-      setStatus(msg.status);
+      document.getElementById('cn').value += msg.cn + '\n';
+      document.getElementById('en').value += msg.en + '\n';
     }
   };
 
@@ -154,18 +85,10 @@ document.getElementById('start').onclick = async () => {
     console.log('[WS] closed');
     setStatus('closed');
   };
+}
 
-  ws.onerror = (err) => {
-    console.error(err);
-    setStatus('error');
-  };
-
-  document.getElementById('start').disabled = true;
-  document.getElementById('stop').disabled = false;
-};
-
-document.getElementById('stop').onclick = async () => {
-  setStatus('stopping');
+function stop() {
+  running = false;
 
   if (processor) processor.disconnect();
   if (source) source.disconnect();
@@ -174,15 +97,13 @@ document.getElementById('stop').onclick = async () => {
     stream.getTracks().forEach(t => t.stop());
   }
 
-  if (audioCtx) await audioCtx.close();
+  if (audioCtx) audioCtx.close();
 
+  // 🔥 DO NOT AUTO CLOSE unless manually stopping
   if (ws) ws.close();
 
-  setStatus('idle');
-
-  document.getElementById('start').disabled = false;
-  document.getElementById('stop').disabled = true;
-};
+  setStatus('stopped');
+}
 </script>
 
 </body>
