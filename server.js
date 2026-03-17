@@ -208,18 +208,24 @@ wss.on('connection', (clientWs) => {
   let alibabaWs = null;
   let alibabaReady = false;
   let alibabaConnecting = false;
+  let keepAlive = null;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
 
   const taskId = newId();
 
   const audioBufferQueue = [];
   let bufferedBytes = 0;
-  const MAX_BUFFER_BYTES = 16000 * 2 * 2;
-
+  const MAX_BUFFER_BYTES = 16000 * 2 * 2; // ~2 seconds buffered audio
   let hasSeenAnyAudio = false;
   let lastAudioAt = 0;
 
-  let reconnectAttempts = 0;
-  let reconnectTimer = null;
+  function clearKeepAlive() {
+    if (keepAlive) {
+      clearInterval(keepAlive);
+      keepAlive = null;
+    }
+  }
 
   function clearReconnectTimer() {
     if (reconnectTimer) {
@@ -228,25 +234,8 @@ wss.on('connection', (clientWs) => {
     }
   }
 
-  function scheduleReconnect(reason) {
-    if (!clientAlive) return;
-    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
-    if (reconnectTimer) return;
-
-    reconnectAttempts += 1;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
-    console.log(`[Alibaba] Reconnect scheduled in ${delay}ms. Reason: ${reason}`);
-
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      if (!clientAlive) return;
-      connectAlibabaIfNeeded(true).catch((e) => {
-        console.error('[Alibaba] Reconnect failed:', e?.message || e);
-      });
-    }, delay);
-  }
-
   function closeAlibaba(sendStop = true) {
+    clearKeepAlive();
     clearReconnectTimer();
 
     if (
@@ -284,6 +273,26 @@ wss.on('connection', (clientWs) => {
     alibabaConnecting = false;
   }
 
+  function scheduleReconnect(reason) {
+    if (!clientAlive) return;
+    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
+    if (reconnectTimer) return;
+    if (alibabaConnecting) return;
+    if (alibabaWs) return;
+
+    reconnectAttempts += 1;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
+    console.log(`[Alibaba] Reconnect scheduled in ${delay}ms. Reason: ${reason}`);
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!clientAlive) return;
+      connectAlibabaIfNeeded(true).catch((e) => {
+        console.error('[Alibaba] Reconnect failed:', e?.message || e);
+      });
+    }, delay);
+  }
+
   async function connectAlibabaIfNeeded(force = false) {
     if (!clientAlive) return;
     if (alibabaWs && !force) return;
@@ -316,27 +325,41 @@ wss.on('connection', (clientWs) => {
       console.log('[Alibaba] WS open');
       reconnectAttempts = 0;
 
-      const start = {
-        header: {
-          message_id: newId(),
-          task_id: taskId,
-          namespace: 'SpeechTranscriber',
-          name: 'StartTranscriber',
-          appkey: ALIBABA_APPKEY,
-        },
-        payload: {
-          format: 'pcm',
-          sample_rate: 16000,
-          enable_intermediate_result: true,
-          enable_punctuation_prediction: true,
-          enable_inverse_text_normalization: true,
-        },
-      };
+      setTimeout(() => {
+        if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) {
+          console.error('[Alibaba] Socket not open when trying to send StartTranscriber');
+          return;
+        }
 
-      const sent = safeWsSend(alibabaWs, JSON.stringify(start));
-      if (!sent) {
-        console.error('[Alibaba] Failed to send StartTranscriber because socket was not open');
-      }
+        const start = {
+          header: {
+            message_id: newId(),
+            task_id: taskId,
+            namespace: 'SpeechTranscriber',
+            name: 'StartTranscriber',
+            appkey: ALIBABA_APPKEY,
+          },
+          payload: {
+            format: 'pcm',
+            sample_rate: 16000,
+            enable_intermediate_result: true,
+            enable_punctuation_prediction: true,
+            enable_inverse_text_normalization: true,
+          },
+        };
+
+        safeWsSend(alibabaWs, JSON.stringify(start));
+        console.log('[Alibaba] StartTranscriber sent');
+
+        // Send silence frames until Alibaba becomes ready
+        const silence = Buffer.alloc(3200);
+        clearKeepAlive();
+        keepAlive = setInterval(() => {
+          if (!alibabaWs || alibabaWs.readyState !== WebSocket.OPEN) return;
+          if (alibabaReady) return;
+          safeWsSend(alibabaWs, silence);
+        }, 100);
+      }, 50);
     });
 
     alibabaWs.on('message', async (data) => {
@@ -353,6 +376,8 @@ wss.on('connection', (clientWs) => {
       if (eventName === 'TranscriptionStarted') {
         alibabaReady = true;
         alibabaConnecting = false;
+        clearKeepAlive();
+
         console.log('[Alibaba] Ready. Flushing buffered audio:', bufferedBytes, 'bytes');
         safeJsonSend(clientWs, { type: 'status', status: 'ready' });
 
@@ -393,9 +418,9 @@ wss.on('connection', (clientWs) => {
         console.error('[Alibaba] TaskFailed FULL >>>', JSON.stringify(msg));
 
         const statusMsg =
+          msg?.header?.status_text ||
           msg?.header?.status_message ||
           msg?.header?.message ||
-          msg?.payload?.message ||
           'unknown';
 
         safeJsonSend(clientWs, {
@@ -405,6 +430,7 @@ wss.on('connection', (clientWs) => {
 
         closeAlibaba(false);
 
+        // force fresh token next time
         tokenState.id = null;
         tokenState.expireTimeSec = null;
 
@@ -414,6 +440,7 @@ wss.on('connection', (clientWs) => {
 
     alibabaWs.on('close', (code, reason) => {
       console.log('[Alibaba] WS closed:', code, reason?.toString?.() || '');
+      clearKeepAlive();
       alibabaReady = false;
       alibabaWs = null;
       alibabaConnecting = false;
