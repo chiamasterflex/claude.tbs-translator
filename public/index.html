@@ -1,414 +1,163 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>TBS Live Translator</title>
+  <title>TBS Live Translator V2</title>
   <style>
-    :root {
-      --bg: #f7f7f8;
-      --panel: #ffffff;
-      --border: #d9d9de;
-      --text: #111827;
-      --muted: #6b7280;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      padding: 24px;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background: var(--bg);
-    }
-
-    h1 {
-      margin: 0 0 20px;
-      font-size: 40px;
-      line-height: 1.1;
-    }
-
-    .toolbar {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-    }
-
-    button {
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      padding: 10px 16px;
-      border-radius: 10px;
-      font-size: 16px;
-      cursor: pointer;
-    }
-
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .status {
-      font-size: 16px;
-      color: var(--muted);
-    }
-
-    .status strong {
-      color: var(--text);
-      font-weight: 600;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 16px;
-    }
-
-    .panel h3 {
-      margin: 0 0 12px;
-      font-size: 20px;
-    }
-
-    textarea {
-      width: 100%;
-      height: 420px;
-      resize: vertical;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px;
-      font-size: 16px;
-      line-height: 1.45;
-      background: #fff;
-      color: var(--text);
-    }
-
-    .meta {
-      margin-top: 14px;
-      font-size: 13px;
-      color: var(--muted);
-      white-space: pre-wrap;
-    }
-
-    @media (max-width: 900px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-
-      h1 {
-        font-size: 32px;
-      }
-
-      textarea {
-        height: 280px;
-      }
-    }
+    body { font-family: sans-serif; padding: 20px; }
+    textarea { width: 48%; height: 300px; }
   </style>
 </head>
 <body>
-  <h1>TBS Live Translator</h1>
 
-  <div class="toolbar">
-    <button id="btnStart">Start</button>
-    <button id="btnStop" disabled>Stop</button>
-    <div class="status">Status: <strong id="status">idle</strong></div>
-  </div>
+<h1>TBS Live Translator V2</h1>
 
-  <div class="grid">
-    <div class="panel">
-      <h3>Live Chinese</h3>
-      <textarea id="cn" readonly></textarea>
-    </div>
+<button id="start">Start</button>
+<button id="stop">Stop</button>
 
-    <div class="panel">
-      <h3>English</h3>
-      <textarea id="en" readonly></textarea>
-    </div>
-  </div>
+<p>Status: <span id="status">idle</span></p>
 
-  <div class="meta" id="meta"></div>
+<div>
+  <textarea id="cn" placeholder="Chinese"></textarea>
+  <textarea id="en" placeholder="English"></textarea>
+</div>
 
-  <script>
-    const btnStart = document.getElementById('btnStart');
-    const btnStop = document.getElementById('btnStop');
-    const statusEl = document.getElementById('status');
-    const cnEl = document.getElementById('cn');
-    const enEl = document.getElementById('en');
-    const metaEl = document.getElementById('meta');
+<script>
+console.log("INDEX V2 LOADED");
 
-    let ws = null;
-    let audioContext = null;
-    let mediaStream = null;
-    let sourceNode = null;
-    let workletNode = null;
-    let zeroGainNode = null;
-    let keepAliveTimer = null;
-    let isRunning = false;
-    let sentFrameCount = 0;
-    let lastBytes = 0;
+let ws;
+let audioContext;
+let processor;
+let source;
+let stream;
 
-    function setStatus(text) {
-      statusEl.textContent = text;
-      console.log('[UI]', text);
+const statusEl = document.getElementById("status");
+const cnEl = document.getElementById("cn");
+const enEl = document.getElementById("en");
+
+function setStatus(s) {
+  statusEl.textContent = s;
+  console.log("[STATUS]", s);
+}
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host + '/ws';
+}
+
+function downsample(buffer, inputRate, outputRate) {
+  const ratio = inputRate / outputRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let sum = 0, count = 0;
+
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      sum += buffer[i];
+      count++;
     }
 
-    function updateMeta() {
-      metaEl.textContent =
-        `frames sent: ${sentFrameCount}\n` +
-        `last bytes: ${lastBytes}\n` +
-        `ws state: ${ws ? ws.readyState : 'none'}\n` +
-        `audio state: ${audioContext ? audioContext.state : 'none'}`;
-    }
+    result[offsetResult] = sum / count;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
 
-    function wsUrl() {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${proto}//${location.host}/ws`;
-    }
+  return result;
+}
 
-    function appendLine(el, text) {
-      if (!text) return;
-      el.value = (el.value + (el.value ? '\n' : '') + text).slice(-50000);
-      el.scrollTop = el.scrollHeight;
-    }
+function floatToPCM16(float32) {
+  const buffer = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buffer);
 
-    function startKeepAlive() {
-      stopKeepAlive();
-      keepAliveTimer = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
-          } catch (err) {
-            console.error('[WS] ping failed', err);
-          }
-        }
-      }, 5000);
-    }
+  let offset = 0;
+  for (let i = 0; i < float32.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
 
-    function stopKeepAlive() {
-      if (keepAliveTimer) {
-        clearInterval(keepAliveTimer);
-        keepAliveTimer = null;
+  return buffer;
+}
+
+async function start() {
+  console.log("START CLICKED");
+
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = async () => {
+    console.log("[WS] open");
+    setStatus("connected");
+
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    audioContext = new AudioContext();
+    source = audioContext.createMediaStreamSource(stream);
+
+    processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+
+      const down = downsample(input, audioContext.sampleRate, 16000);
+      const pcm = floatToPCM16(down);
+
+      if (ws.readyState === 1) {
+        ws.send(pcm);
+        console.log("[AUDIO] sent", pcm.byteLength);
       }
-    }
+    };
 
-    async function startAudio() {
-      setStatus('mic_permission');
+    source.connect(processor);
+    processor.connect(audioContext.destination);
 
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false
-        }
-      });
+    setStatus("streaming");
+  };
 
-      audioContext = new (window.AudioContext || window.webkitAudioContext)({
-        latencyHint: 'interactive'
-      });
+  ws.onmessage = (msg) => {
+    try {
+      const data = JSON.parse(msg.data);
 
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
+      if (data.type === "live_cn") {
+        cnEl.value = data.text;
       }
 
-      console.log('[Audio] input sampleRate', audioContext.sampleRate);
-
-      await audioContext.audioWorklet.addModule('/pcm16-worklet.js');
-
-      sourceNode = audioContext.createMediaStreamSource(mediaStream);
-      workletNode = new AudioWorkletNode(audioContext, 'pcm16-worklet', {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-        processorOptions: {
-          targetSampleRate: 16000,
-          frameSamples: 1600
-        }
-      });
-
-      zeroGainNode = audioContext.createGain();
-      zeroGainNode.gain.value = 0;
-
-      workletNode.port.onmessage = (event) => {
-        const msg = event.data;
-        if (!msg || msg.type !== 'pcm') return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        try {
-          ws.send(msg.buffer);
-          sentFrameCount++;
-          lastBytes = msg.bytes || 0;
-          if (sentFrameCount % 10 === 0) {
-            console.log('[Audio] sent frames', sentFrameCount, 'last bytes', lastBytes);
-          }
-          updateMeta();
-        } catch (err) {
-          console.error('[Audio] send failed', err);
-        }
-      };
-
-      sourceNode.connect(workletNode);
-      workletNode.connect(zeroGainNode);
-      zeroGainNode.connect(audioContext.destination);
-
-      console.log('[Audio] worklet pipeline active');
-      setStatus('streaming_pcm16_16k');
-      updateMeta();
-    }
-
-    async function start() {
-      if (isRunning) return;
-      isRunning = true;
-      sentFrameCount = 0;
-      lastBytes = 0;
-
-      btnStart.disabled = true;
-      btnStop.disabled = false;
-      cnEl.value = '';
-      enEl.value = '';
-
-      setStatus('connecting');
-
-      ws = new WebSocket(wsUrl());
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = async () => {
-        console.log('[WS] open');
-        setStatus('ws_open');
-        startKeepAlive();
-
-        try {
-          await startAudio();
-        } catch (err) {
-          console.error('[Audio] start failed', err);
-          setStatus('audio_error');
-        }
-      };
-
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          console.log('[WS] message', msg);
-
-          if (msg.type === 'status') {
-            setStatus(msg.status);
-          }
-
-          if (msg.type === 'live_cn') {
-            cnEl.value = msg.text || '';
-          }
-
-          if (msg.type === 'final') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'manual_result') {
-            appendLine(cnEl, msg.cn);
-            appendLine(enEl, msg.en);
-          }
-
-          if (msg.type === 'error') {
-            console.error('[Server error]', msg.message);
-            setStatus(`error`);
-          }
-        } catch (err) {
-          console.error('[WS] bad message', err);
-        }
-      };
-
-      ws.onclose = () => {
-        console.log('[WS] closed');
-        stopKeepAlive();
-        setStatus('ws_closed');
-        updateMeta();
-      };
-
-      ws.onerror = (err) => {
-        console.error('[WS] error', err);
-        setStatus('ws_error');
-      };
-
-      updateMeta();
-    }
-
-    async function stop() {
-      console.log('[UI] manual stop');
-      isRunning = false;
-      stopKeepAlive();
-
-      btnStart.disabled = false;
-      btnStop.disabled = true;
-
-      try {
-        if (sourceNode) sourceNode.disconnect();
-      } catch (_) {}
-
-      try {
-        if (workletNode) workletNode.disconnect();
-      } catch (_) {}
-
-      try {
-        if (zeroGainNode) zeroGainNode.disconnect();
-      } catch (_) {}
-
-      try {
-        if (mediaStream) {
-          mediaStream.getTracks().forEach(track => track.stop());
-        }
-      } catch (_) {}
-
-      try {
-        if (audioContext && audioContext.state !== 'closed') {
-          await audioContext.close();
-        }
-      } catch (_) {}
-
-      try {
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-          ws.close();
-        }
-      } catch (_) {}
-
-      sourceNode = null;
-      workletNode = null;
-      zeroGainNode = null;
-      mediaStream = null;
-      audioContext = null;
-      ws = null;
-
-      setStatus('idle');
-      updateMeta();
-    }
-
-    btnStart.onclick = start;
-    btnStop.onclick = stop;
-
-    document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState === 'visible' && audioContext && audioContext.state === 'suspended') {
-        try {
-          await audioContext.resume();
-          console.log('[Audio] resumed');
-          updateMeta();
-        } catch (_) {}
+      if (data.type === "final") {
+        cnEl.value += "\n" + data.cn;
+        enEl.value += "\n" + data.en;
       }
-    });
+    } catch {}
+  };
 
-    window.addEventListener('beforeunload', () => {
-      stop();
-    });
+  ws.onclose = () => {
+    console.log("[WS] closed");
+    setStatus("closed");
+  };
 
-    updateMeta();
-  </script>
+  ws.onerror = (e) => {
+    console.log("[WS] error", e);
+  };
+}
+
+function stop() {
+  console.log("STOP CLICKED");
+
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (audioContext) audioContext.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ws) ws.close();
+
+  setStatus("stopped");
+}
+
+document.getElementById("start").onclick = start;
+document.getElementById("stop").onclick = stop;
+</script>
+
 </body>
 </html>
