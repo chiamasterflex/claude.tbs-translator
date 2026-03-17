@@ -6,6 +6,7 @@ const { createServer } = require('http');
 const axios = require('axios');
 const crypto = require('crypto');
 const path = require('path');
+const Core = require('@alicloud/pop-core');
 
 const app = express();
 const server = createServer(app);
@@ -15,6 +16,7 @@ const server = createServer(app);
 // --------------------
 const PORT = process.env.PORT || 8080;
 
+// Your exact Railway variable names
 const ALIBABA_AK_ID = process.env.ALIBABA_AK_ID;
 const ALIBABA_AK_SECRET = process.env.ALIBABA_AK_SECRET;
 const ALIBABA_APPKEY = process.env.ALIBABA_APPKEY;
@@ -23,8 +25,7 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 // Keep everything in Singapore region
 const REGION = 'ap-southeast-1';
 const ALIBABA_WS_BASE = `wss://nls-gateway-${REGION}.aliyuncs.com/ws/v1`;
-const NLS_META_HOST = `nlsmeta.${REGION}.aliyuncs.com`;
-const NLS_META_BASE = `https://${NLS_META_HOST}/`;
+const ALIBABA_TOKEN_ENDPOINT = `https://nlsmeta.${REGION}.aliyuncs.com`;
 
 // --------------------
 // Validation
@@ -51,33 +52,8 @@ function safeJsonSend(ws, obj) {
   }
 }
 
-function percentEncode(str) {
-  return encodeURIComponent(String(str))
-    .replace(/\!/g, '%21')
-    .replace(/\'/g, '%27')
-    .replace(/\(/g, '%28')
-    .replace(/\)/g, '%29')
-    .replace(/\*/g, '%2A');
-}
-
-function buildCanonicalizedQuery(params) {
-  const sortedKeys = Object.keys(params).sort();
-  return sortedKeys
-    .map((k) => `${percentEncode(k)}=${percentEncode(params[k])}`)
-    .join('&');
-}
-
-function signAliyun(params, accessKeySecret) {
-  const canonicalized = buildCanonicalizedQuery(params);
-  const stringToSign = `GET&%2F&${percentEncode(canonicalized)}`;
-  return crypto
-    .createHmac('sha1', `${accessKeySecret}&`)
-    .update(stringToSign)
-    .digest('base64');
-}
-
 // --------------------
-// Alibaba token manager
+// Alibaba token manager using SDK
 // --------------------
 const tokenState = {
   id: null,
@@ -85,52 +61,37 @@ const tokenState = {
   refreshing: null,
 };
 
-async function createAlibabaNlsTokenViaOpenAPI() {
-  const params = {
-    AccessKeyId: ALIBABA_AK_ID,
-    Action: 'CreateToken',
-    Version: '2019-02-28',
-    Format: 'JSON',
-    RegionId: REGION,
-    SignatureMethod: 'HMAC-SHA1',
-    SignatureVersion: '1.0',
-    SignatureNonce: crypto.randomUUID(),
-    Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-  };
+const alibabaClient = new Core({
+  accessKeyId: ALIBABA_AK_ID,
+  accessKeySecret: ALIBABA_AK_SECRET,
+  endpoint: ALIBABA_TOKEN_ENDPOINT,
+  apiVersion: '2019-07-17',
+});
 
-  const signature = signAliyun(params, ALIBABA_AK_SECRET);
-  const qs = `Signature=${percentEncode(signature)}&${buildCanonicalizedQuery(params)}`;
-  const url = `${NLS_META_BASE}?${qs}`;
+async function createAlibabaTokenViaSDK() {
+  try {
+    const result = await alibabaClient.request(
+      'CreateToken',
+      {},
+      { method: 'POST' }
+    );
 
- let resp;
+    const tokenId = result?.Token?.Id;
+    const expireTime = result?.Token?.ExpireTime;
 
-try {
-  resp = await axios.get(url, {
-    timeout: 15000,
-    headers: {
-      Host: NLS_META_HOST,
-      Accept: 'application/json',
-    },
-  });
-} catch (err) {
-  console.error('❌ FULL ALIBABA ERROR >>>');
-  console.error(err.response?.data || err.message);
-  console.error('❌ REQUEST URL >>>');
-  console.error(url.replace(/Signature=[^&]+/, 'Signature=***'));
-  throw err;
-}
+    if (!tokenId || !expireTime) {
+      throw new Error(`Unexpected token response: ${JSON.stringify(result).slice(0, 400)}`);
+    }
 
-  const tokenId = resp.data?.Token?.Id;
-  const expireTime = resp.data?.Token?.ExpireTime;
-
-  if (!tokenId || !expireTime) {
-    throw new Error(`Unexpected token response: ${JSON.stringify(resp.data).slice(0, 400)}`);
+    return {
+      tokenId,
+      expireTimeSec: Number(expireTime),
+    };
+  } catch (err) {
+    console.error('❌ FULL ALIBABA SDK ERROR >>>');
+    console.error(err?.data || err?.message || err);
+    throw err;
   }
-
-  return {
-    tokenId,
-    expireTimeSec: Number(expireTime),
-  };
 }
 
 async function ensureAlibabaTokenFresh() {
@@ -148,7 +109,7 @@ async function ensureAlibabaTokenFresh() {
   if (tokenState.refreshing) return tokenState.refreshing;
 
   tokenState.refreshing = (async () => {
-    const { tokenId, expireTimeSec } = await createAlibabaNlsTokenViaOpenAPI();
+    const { tokenId, expireTimeSec } = await createAlibabaTokenViaSDK();
     tokenState.id = tokenId;
     tokenState.expireTimeSec = expireTimeSec;
 
@@ -418,7 +379,6 @@ wss.on('connection', (clientWs) => {
 
         closeAlibaba();
 
-        // force refresh token next time
         tokenState.id = null;
         tokenState.expireTimeSec = null;
 
